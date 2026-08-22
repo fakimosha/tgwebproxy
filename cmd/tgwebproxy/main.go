@@ -23,6 +23,7 @@ import (
 	"tgwebproxy/internal/metrics"
 	"tgwebproxy/internal/relay"
 	"tgwebproxy/internal/secret"
+	"tgwebproxy/internal/share"
 )
 
 func main() {
@@ -337,8 +338,12 @@ func printConnectionDetails(cfg *config.Config) {
 		fmt.Printf("    Web proxy hostname : %s\n", domain.Name)
 		for _, entry := range domain.Entries {
 			fmt.Printf("    Secret (%s) : %s\n", entry.Label, entry.Secret.Hex())
+			fmt.Printf("      %s\n", share.Link(domain.Name, entry.Secret))
 		}
 	}
+	fmt.Println()
+	fmt.Println("  The link configures the client in one step. t.me does not route")
+	fmt.Println("  this path yet, so it may need to be opened inside Telegram.")
 	fmt.Println()
 }
 

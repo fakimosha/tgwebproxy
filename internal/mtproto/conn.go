@@ -3,6 +3,7 @@ package mtproto
 import (
 	"context"
 	"crypto/cipher"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -60,9 +61,9 @@ func DialDC(
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: 10 * time.Second}
 	}
-	conn, err := dialer.DialContext(ctx, "tcp", target.Address)
+	conn, err := dialAny(ctx, dialer, target)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", target, err)
+		return nil, err
 	}
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
@@ -73,6 +74,44 @@ func DialDC(
 		return nil, err
 	}
 	return stream, nil
+}
+
+// dialAny tries IPv4 and then IPv6, so the relay works on a host with either
+// stack. Each attempt gets a share of the deadline: on a host with no IPv4
+// route the first attempt fails at once, but one whose IPv4 path is blackholed
+// would otherwise spend the whole budget before ever trying IPv6.
+func dialAny(ctx context.Context, dialer *net.Dialer, target dc.Target) (net.Conn, error) {
+	addresses := make([]string, 0, 2)
+	if target.Address != "" {
+		addresses = append(addresses, target.Address)
+	}
+	if target.AddressV6 != "" {
+		addresses = append(addresses, target.AddressV6)
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("dial %s: no address", target)
+	}
+
+	var errs []error
+	for i, address := range addresses {
+		attemptCtx, cancel := ctx, context.CancelFunc(nil)
+		if deadline, ok := ctx.Deadline(); ok && i < len(addresses)-1 {
+			left := time.Until(deadline)
+			attemptCtx, cancel = context.WithTimeout(ctx, left/time.Duration(len(addresses)-i))
+		}
+		conn, err := dialer.DialContext(attemptCtx, "tcp", address)
+		if cancel != nil {
+			cancel()
+		}
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("dial %s: %w", target, errors.Join(errs...))
 }
 
 func HandshakeOver(

@@ -48,8 +48,13 @@ The relay prints what to enter in the client:
   Telegram Desktop -> Settings -> Advanced -> Connection type -> Add proxy -> WEB
 
     Web proxy hostname : proxy.example.com
-    Secret             : 000102030405060708090a0b0c0d0e0f
+    Secret (default) : 000102030405060708090a0b0c0d0e0f
+      https://t.me/webproxy?secret=000102030405060708090a0b0c0d0e0f&server=proxy.example.com
 ```
+
+The link configures the client in one step, which beats dictating thirty-two
+hex characters. `t.me` does not route this path yet, so it may have to be
+opened inside Telegram rather than from a browser.
 
 ### Configuration
 
@@ -281,6 +286,7 @@ is one static binary with no companion processes.
 | Data-centre leg | built in | delegated to a stock MTProxy |
 | Needs Caddy/nginx | no, ACME built in | yes, Caddy owns 443 |
 | Deployment | any Go target, Docker | x86_64 Debian/Ubuntu installer |
+| Data-centre transport | IPv4 with IPv6 fallback | whatever MTProxy does |
 | Carriers | WebSocket | WebSocket, HTTP long poll, and per-stream lanes |
 | Frame batching | one frame per message | up to 4096 frames per message |
 | Cover site | static directory or built-in | static directory or loopback upstream |
