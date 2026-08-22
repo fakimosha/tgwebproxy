@@ -156,12 +156,16 @@ func (t *Twin) Pump() error {
 		if err != nil {
 			return fmt.Errorf("relay sent an unparsable message: %w", err)
 		}
-		// The WebView carrier requires one frame per native message.
-		if len(frames) != 1 {
-			return fmt.Errorf("relay put %d frames in one message", len(frames))
+		// A relay message may carry a batch: Telegram's reference relay packs
+		// up to 4096 frames into one, and its bridge page hands the message to
+		// the client whole.
+		if len(frames) == 0 {
+			return fmt.Errorf("relay sent an empty message")
 		}
-		if err := t.handle(frames[0]); err != nil {
-			return err
+		for _, f := range frames {
+			if err := t.handle(f); err != nil {
+				return err
+			}
 		}
 	}
 }

@@ -197,7 +197,7 @@ func dialRelay(t *testing.T, server *httptest.Server, capability string, origin 
 }
 
 func TestWebSocketRequiresCapability(t *testing.T) {
-	h, sec := testHandler(t, func(c *Config) {
+	h, _ := testHandler(t, func(c *Config) {
 		c.Relay = relay.Options{Dial: refusingDialer}
 	})
 	server := httptest.NewServer(h)
@@ -209,8 +209,26 @@ func TestWebSocketRequiresCapability(t *testing.T) {
 	if _, _, err := dialRelay(t, server, "wrong", "https://"+testDomain); err == nil {
 		t.Fatal("upgrade with a wrong capability must fail")
 	}
-	if _, _, err := dialRelay(t, server, sec.Capability(testDomain), "https://evil.example.com"); err == nil {
-		t.Fatal("upgrade from a foreign origin must fail")
+}
+
+// The capability is what authenticates an upgrade, never the Origin header. A
+// native WebView may omit it entirely, and Telegram's own reference relay
+// stopped checking it for that reason, so neither a missing nor a foreign
+// origin may keep a legitimate client out.
+func TestOriginDoesNotGateTheUpgrade(t *testing.T) {
+	h, sec := testHandler(t, func(c *Config) {
+		c.Relay = relay.Options{Dial: refusingDialer}
+	})
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	for _, origin := range []string{"", "https://evil.example.com", "null"} {
+		conn, _, err := dialRelay(t, server, sec.Capability(testDomain), origin)
+		if err != nil {
+			t.Errorf("upgrade with origin %q was refused: %v", origin, err)
+			continue
+		}
+		conn.Close()
 	}
 }
 

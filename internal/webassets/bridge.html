@@ -24,9 +24,9 @@ h1{font-size:1.25rem;font-weight:600;margin:0 0 .5rem}
 (() => {
 "use strict";
 
-// Byte-for-byte forwarder; it never parses a frame. The relay emits exactly one
-// frame per WebSocket message, so one-to-one forwarding gives the client the one
-// frame per native message that tdesktop's WebView carrier expects.
+// Byte-for-byte forwarder; it never parses a frame. A message may carry one
+// frame or a batch of them — the client handles both — so forwarding whole
+// messages one to one is correct either way.
 
 const stateNode = document.getElementById("state");
 const upNode = document.getElementById("up");

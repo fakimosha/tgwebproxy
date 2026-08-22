@@ -364,11 +364,10 @@ func (s *session) shutdownStreams() {
 
 // send queues one frame as its own transport message.
 //
-// One frame per message is a deliberate constraint, not a simplification: the
-// WebView carrier in tdesktop is documented to expect the bridge page to post
-// one frame per native message, and our bridge page is a byte-for-byte
-// forwarder. Emitting one frame per message makes that hold by construction
-// and keeps the page free of any need to parse frames.
+// The client accepts batches — Telegram's reference relay packs up to 4096
+// frames per message — so this is our choice, not a requirement: it keeps the
+// bridge page a byte-for-byte forwarder with no need to parse frames. Batching
+// is a throughput optimisation to make with measurements, not on principle.
 func (s *session) send(t frame.Type, streamID uint32, payload []byte) error {
 	if !t.SendableByRelay() {
 		return fmt.Errorf("relay: refusing to send %v, the client has no handler for it", t)

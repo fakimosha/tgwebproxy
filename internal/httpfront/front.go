@@ -98,11 +98,14 @@ func builtinCover(w http.ResponseWriter, r *http.Request) {
 	w.Write(webassets.CoverPage())
 }
 
-// checkOrigin accepts only our own origin. In the hidden WebView the bridge
-// page is the top document on this domain; in the browser fallback it runs in
-// a same-origin iframe. Either way the Origin header is our own https origin.
-func (h *Handler) checkOrigin(r *http.Request) bool {
-	return r.Header.Get("Origin") == "https://"+h.cfg.Domain
+// checkOrigin accepts every origin, deliberately. Telegram's own reference
+// relay dropped its origin check for the same reason (tproxy-server commit
+// "Remove origin checks"): a native WebView may omit the header entirely, so
+// requiring it locks out the very client this exists for. Nothing is lost —
+// a non-browser peer can forge any origin, and the capability in the query is
+// what actually authenticates the upgrade.
+func (h *Handler) checkOrigin(*http.Request) bool {
+	return true
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
