@@ -37,6 +37,26 @@ type Upstream struct {
 
 type DialFunc func(ctx context.Context, protocol uint32, dcID int16) (*Upstream, error)
 
+// Reporter receives counts for the admin listener. The relay never formats a
+// metric itself, so it keeps no opinion about how they are exported.
+type Reporter interface {
+	StreamOpened()
+	StreamClosed()
+	UpstreamDialFailed()
+	ProtocolError()
+	BytesUp(n int)
+	BytesDown(n int)
+}
+
+type nopReporter struct{}
+
+func (nopReporter) StreamOpened()       {}
+func (nopReporter) StreamClosed()       {}
+func (nopReporter) UpstreamDialFailed() {}
+func (nopReporter) ProtocolError()      {}
+func (nopReporter) BytesUp(int)         {}
+func (nopReporter) BytesDown(int)       {}
+
 type Options struct {
 	// Secret is the proxy secret; only its obfuscation half is used here.
 	Secret secret.Secret
@@ -50,6 +70,8 @@ type Options struct {
 	// It also bounds the initial Hello.
 	IdleTimeout time.Duration
 	DialTimeout time.Duration
+	// Metrics receives counts. Nil means no accounting.
+	Metrics Reporter
 }
 
 func (o Options) withDefaults() Options {
@@ -70,6 +92,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.DialTimeout <= 0 {
 		o.DialTimeout = 10 * time.Second
+	}
+	if o.Metrics == nil {
+		o.Metrics = nopReporter{}
 	}
 	return o
 }
@@ -148,6 +173,9 @@ func Serve(ctx context.Context, conn MessageConn, opts Options) error {
 	go s.watchdog()
 
 	err := s.readLoop()
+	if err != nil && errors.Is(err, ErrProtocol) {
+		opts.Metrics.ProtocolError()
+	}
 
 	s.cancel()
 	s.shutdownStreams()

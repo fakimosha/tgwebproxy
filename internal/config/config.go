@@ -28,6 +28,11 @@ type file struct {
 	LogLevel    string      `toml:"log_level"`
 	MaxStreams  int         `toml:"max_streams"`
 	Diagnose    bool        `toml:"diagnose"`
+	Admin       fileAdmin   `toml:"admin"`
+}
+
+type fileAdmin struct {
+	Listen string `toml:"listen"`
 }
 
 type fileEntry struct {
@@ -60,6 +65,8 @@ type Config struct {
 	Diagnose    bool
 	LogLevel    slog.Level
 	MaxStreams  int
+	// AdminListen serves health and metrics. Empty disables it.
+	AdminListen string
 }
 
 func Load(path string) (*Config, error) {
@@ -121,6 +128,8 @@ func Parse(data []byte) (*Config, error) {
 		}
 		cfg.LogLevel = level
 	}
+
+	cfg.AdminListen = strings.TrimSpace(raw.Admin.Listen)
 
 	cfg.Domains, err = parseDomains(raw)
 	if err != nil {
@@ -210,6 +219,7 @@ func (c *Config) CheckStaticMatch(next *Config) error {
 		{"listen", c.Listen, next.Listen},
 		{"plain_listen", c.PlainListen, next.PlainListen},
 		{"cert_dir", c.CertDir, next.CertDir},
+		{"admin.listen", c.AdminListen, next.AdminListen},
 	} {
 		if field.old != field.fresh {
 			return fmt.Errorf("config: %s cannot change without a restart (%q -> %q)",

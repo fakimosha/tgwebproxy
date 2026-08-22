@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"tgwebproxy/internal/secret"
@@ -176,6 +177,27 @@ func TestSingleDomainAcceptsAnyHost(t *testing.T) {
 	for _, host := range []string{testDomain, "127.0.0.1:4600", "backend.internal", ""} {
 		if !bridgeFor(t, h, host, capability) {
 			t.Errorf("Host %q was not served by a single-domain relay", host)
+		}
+	}
+}
+
+// The admin paths live on their own loopback listener. On 443 they must be
+// nothing but ordinary URLs, or the relay answers "I am a relay" to anyone who
+// asks.
+func TestAdminPathsDoNotExistOnThePublicPort(t *testing.T) {
+	h := twoDomains(t)
+	for _, path := range []string{"/metrics", "/healthz", "/readyz", "/debug/pprof/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = testDomain
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		body := rec.Body.String()
+		if strings.Contains(body, "tgwp_") || strings.Contains(body, "ok\n") {
+			t.Errorf("%s leaked an admin response: %q", path, body)
+		}
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s answered %d; the built-in cover serves 404 off the root", path, rec.Code)
 		}
 	}
 }

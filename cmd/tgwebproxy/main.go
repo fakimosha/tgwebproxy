@@ -8,15 +8,19 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"tgwebproxy/internal/admin"
 	"tgwebproxy/internal/config"
+	"tgwebproxy/internal/dc"
 	"tgwebproxy/internal/hostname"
 	"tgwebproxy/internal/httpfront"
+	"tgwebproxy/internal/metrics"
 	"tgwebproxy/internal/relay"
 	"tgwebproxy/internal/secret"
 )
@@ -44,7 +48,11 @@ func run() error {
 	)
 	flag.Parse()
 
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
 	cfg, err := resolveConfig(*configPath, flagValues{
+		explicit:    explicit,
 		domain:      *domain,
 		secretText:  *secretText,
 		siteDir:     *siteDir,
@@ -66,9 +74,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	registry := metrics.New()
 	handler, err := httpfront.New(httpfront.Config{
 		Domains:     domains,
 		Logger:      log,
+		Metrics:     registry,
 		BehindProxy: cfg.BehindProxy,
 		Diagnose:    cfg.Diagnose,
 		Relay: relay.Options{
@@ -98,6 +108,21 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.AdminListen != "" {
+		adminServer, err := admin.New(cfg.AdminListen, registry, reachTelegram)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := adminServer.Run(ctx); err != nil {
+				log.Error("admin listener failed", "error", err)
+			}
+		}()
+		log.Info("admin listening", "address", cfg.AdminListen)
+	}
+
+	selfCheck(ctx, cfg, log)
+
 	if *configPath != "" {
 		go watchReloads(ctx, *configPath, cfg, handler, log)
 	}
@@ -121,7 +146,62 @@ func buildDomains(cfg *config.Config) ([]httpfront.Domain, error) {
 	return out, nil
 }
 
+// reachTelegram opens and drops a TCP connection to a data centre. It answers
+// the one question a health check cannot answer from inside the process: can
+// this host talk to Telegram at all.
+func reachTelegram(ctx context.Context) error {
+	target, err := dc.Resolve(2)
+	if err != nil {
+		return err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", target.Address)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+// selfCheck turns "deployed it and it silently does nothing" into a log line
+// naming the broken part. Nothing here prevents start-up: a relay that refused
+// to run because a data centre was briefly unreachable would be worse.
+func selfCheck(ctx context.Context, cfg *config.Config, log *slog.Logger) {
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := reachTelegram(checkCtx); err != nil {
+		log.Warn("cannot reach a Telegram data centre from this host", "error", err)
+	}
+	if cfg.BehindProxy && !loopbackListen(cfg.Listen) {
+		log.Warn("behind_proxy is set but the relay listens beyond the loopback, "+
+			"which exposes it without TLS", "listen", cfg.Listen)
+	}
+	if !cfg.BehindProxy {
+		if err := os.MkdirAll(cfg.CertDir, 0o700); err != nil {
+			log.Warn("the certificate cache is not writable; every restart will "+
+				"ask Let's Encrypt for a fresh certificate", "dir", cfg.CertDir, "error", err)
+		}
+	}
+	for _, domain := range cfg.Domains {
+		if domain.Site == "" {
+			log.Warn("serving the built-in cover page, which is a placeholder: "+
+				"point site at something you would plausibly host", "domain", domain.Name)
+		}
+	}
+}
+
+func loopbackListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 type flagValues struct {
+	explicit    map[string]bool
 	domain      string
 	secretText  string
 	siteDir     string
@@ -134,12 +214,32 @@ type flagValues struct {
 	logLevel    string
 }
 
+// explicitlySet lists the flags the operator passed that the file would
+// override. Silently ignoring them is how someone spends an afternoon
+// wondering why -listen had no effect.
+func (f flagValues) explicitlySet() []string {
+	var out []string
+	for _, name := range []string{
+		"site", "cert-dir", "listen", "plain-listen",
+		"max-streams", "diagnose", "behind-proxy", "log-level",
+	} {
+		if f.explicit[name] {
+			out = append(out, "-"+name)
+		}
+	}
+	return out
+}
+
 // resolveConfig produces one snapshot from either the file or the flags. The
 // two are never merged: a half-configured relay is worse than a refusal.
 func resolveConfig(path string, flags flagValues) (*config.Config, error) {
 	if path != "" {
 		if flags.domain != "" || flags.secretText != "" {
 			return nil, fmt.Errorf("-config cannot be combined with -domain or -secret")
+		}
+		if ignored := flags.explicitlySet(); len(ignored) > 0 {
+			return nil, fmt.Errorf("-config takes precedence, so %s would be ignored; "+
+				"move the setting into the file", strings.Join(ignored, ", "))
 		}
 		return config.Load(path)
 	}

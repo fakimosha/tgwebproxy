@@ -80,6 +80,7 @@ func (st *stream) run() {
 
 	upstream, err := st.session.opts.Dial(st.session.ctx, hello.Protocol, hello.DCID)
 	if err != nil {
+		st.session.opts.Metrics.UpstreamDialFailed()
 		st.log.Warn("upstream dial failed", "error", err, "dc", hello.DCID)
 		return
 	}
@@ -92,6 +93,8 @@ func (st *stream) run() {
 		return
 	default:
 	}
+	st.session.opts.Metrics.StreamOpened()
+	defer st.session.opts.Metrics.StreamClosed()
 	st.log.Info("stream open",
 		"upstream", upstream.Name,
 		"transport", mtproto.ProtocolName(hello.Protocol))
@@ -123,6 +126,7 @@ func (st *stream) writeUpstream(upstream io.Writer, chunk []byte) bool {
 		st.log.Debug("upstream write failed", "error", err)
 		return false
 	}
+	st.session.opts.Metrics.BytesUp(len(chunk))
 	return st.grant(len(chunk))
 }
 
@@ -180,6 +184,7 @@ func (st *stream) pump(upstream io.Reader, hello *mtproto.ClientHello) {
 			if sendErr := st.session.send(frame.Data, st.id, buf[:n]); sendErr != nil {
 				return
 			}
+			st.session.opts.Metrics.BytesDown(n)
 		} else {
 			st.credit.giveBack(reserved)
 		}

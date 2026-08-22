@@ -162,6 +162,41 @@ its `wss://` URL from it. The vhost must forward the WebSocket upgrade
 (`Upgrade`/`Connection` headers) and should keep the query string out of the
 access log, because the capability is a bearer credential.
 
+## Health and metrics
+
+```toml
+[admin]
+listen = "127.0.0.1:9600"
+```
+
+`/healthz` says the process is alive, `/readyz` opens and drops a TCP
+connection to a data centre — the one question a process cannot answer about
+itself — and `/metrics` serves the Prometheus text format with no dependency
+behind it:
+
+```
+tgwp_sessions_active{domain="files.example.com",label="phone"} 1
+tgwp_bytes_up_total{domain="files.example.com",label="phone"} 148213
+tgwp_bytes_down_total{domain="files.example.com",label="phone"} 9930118
+tgwp_streams_opened_total{domain="files.example.com",label="phone"} 12
+tgwp_upstream_dial_failures_total{domain="files.example.com",label="phone"} 0
+tgwp_gate_rejections_total{domain="files.example.com"} 431
+```
+
+Because every series carries the secret's label, traffic is attributed per
+client, which is what makes handing out access with a bot practical: issue a
+labelled secret, watch what it uses, remove the line and `SIGHUP` when the
+subscription ends.
+
+The listener must be on the loopback — the relay refuses to start otherwise,
+and a test asserts these paths do not exist on 443. An admin endpoint on the
+public port would be a fingerprint that undoes the gate.
+
+At start-up the relay also checks itself and says so in the log: whether this
+host can reach a data centre at all, whether `behind_proxy` is set while
+listening beyond the loopback, whether the certificate cache is writable, and
+whether a domain is still serving the built-in placeholder page.
+
 ## Checking a deployment
 
 ```bash

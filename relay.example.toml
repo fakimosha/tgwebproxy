@@ -13,6 +13,12 @@ cert_dir     = "certs"
 log_level    = "info"
 max_streams  = 64
 
+# Health and metrics. Loopback only, and the relay refuses to start if this is
+# anything else: an endpoint on the public port would be a fingerprint that
+# undoes the capability gate. Empty disables it.
+[admin]
+listen = "127.0.0.1:9600"
+
 # Static cover site. Point it at something you would plausibly host.
 site = ""
 

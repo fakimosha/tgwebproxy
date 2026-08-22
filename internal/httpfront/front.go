@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"tgwebproxy/internal/metrics"
 	"tgwebproxy/internal/relay"
 	"tgwebproxy/internal/secret"
 	"tgwebproxy/internal/webassets"
@@ -36,6 +37,9 @@ type Config struct {
 	// Diagnose logs one line per request (never the capability itself). Off by
 	// default: a relay that keeps request logs can betray its users.
 	Diagnose bool
+	// Metrics receives counts, labelled by domain and by the secret's label.
+	// Nil means no accounting.
+	Metrics *metrics.Registry
 }
 
 // Domain is one served name.
@@ -48,6 +52,7 @@ type Domain struct {
 // Handler serves the cover site, the bridge page, and the relay socket.
 type Handler struct {
 	log         *slog.Logger
+	metrics     *metrics.Registry
 	relay       relay.Options
 	behindProxy bool
 	diagnose    bool
@@ -92,6 +97,7 @@ func New(cfg Config) (*Handler, error) {
 
 	h := &Handler{
 		log:         cfg.Logger,
+		metrics:     cfg.Metrics,
 		relay:       cfg.Relay,
 		behindProxy: cfg.BehindProxy,
 		diagnose:    cfg.Diagnose,
@@ -256,6 +262,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"agent", shortAgent(r.UserAgent()))
 	}
 
+	if !authorized {
+		h.count("tgwp_gate_rejections_total", 1, "domain", domain.name)
+	}
+
 	if upgrade {
 		if !authorized {
 			// Answer an unauthorised upgrade the way a site with no
@@ -347,9 +357,14 @@ func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request, state *live
 	})
 	defer h.sessions.remove(id)
 
+	h.count("tgwp_sessions_started_total", 1, "domain", domain.name, "label", entry.Label)
+	h.count("tgwp_sessions_active", 1, "domain", domain.name, "label", entry.Label)
+	defer h.count("tgwp_sessions_active", -1, "domain", domain.name, "label", entry.Label)
+
 	opts := h.relay
 	opts.Secret = entry.Secret
 	opts.MaxStreams = state.maxStreams
+	opts.Metrics = &reporter{registry: h.metrics, domain: domain.name, label: entry.Label}
 	opts.Logger = h.log.With("peer", h.peerLabel(r), "domain", domain.name, "label", entry.Label)
 
 	if err := relay.Serve(ctx, &wsConn{conn: conn}, opts); err != nil {
@@ -417,3 +432,32 @@ func (c *wsConn) WriteMessage(data []byte) error {
 func (c *wsConn) Close() error { return c.conn.Close() }
 
 var _ relay.MessageConn = (*wsConn)(nil)
+
+func (h *Handler) count(name string, delta int64, labels ...string) {
+	if h.metrics != nil {
+		h.metrics.Add(name, delta, labels...)
+	}
+}
+
+// reporter binds the relay's counts to one session's domain and label.
+type reporter struct {
+	registry *metrics.Registry
+	domain   string
+	label    string
+}
+
+func (r *reporter) add(name string, delta int64) {
+	if r.registry != nil {
+		r.registry.Add(name, delta, "domain", r.domain, "label", r.label)
+	}
+}
+
+func (r *reporter) StreamOpened() {
+	r.add("tgwp_streams_opened_total", 1)
+	r.add("tgwp_streams_active", 1)
+}
+func (r *reporter) StreamClosed()       { r.add("tgwp_streams_active", -1) }
+func (r *reporter) UpstreamDialFailed() { r.add("tgwp_upstream_dial_failures_total", 1) }
+func (r *reporter) ProtocolError()      { r.add("tgwp_protocol_errors_total", 1) }
+func (r *reporter) BytesUp(n int)       { r.add("tgwp_bytes_up_total", int64(n)) }
+func (r *reporter) BytesDown(n int)     { r.add("tgwp_bytes_down_total", int64(n)) }
