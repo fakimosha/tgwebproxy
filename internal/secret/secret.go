@@ -107,6 +107,13 @@ func (s Secret) Obfuscation() []byte {
 	return s.raw
 }
 
+// Equal compares two secrets in constant time. It decides whether a live
+// session survives a reload, which is close enough to the credential path to
+// be worth keeping constant time.
+func (s Secret) Equal(other Secret) bool {
+	return subtle.ConstantTimeCompare(s.raw, other.raw) == 1
+}
+
 func (s Secret) Hex() string { return hex.EncodeToString(s.raw) }
 
 func (s Secret) Base64URL() string { return base64.RawURLEncoding.EncodeToString(s.raw) }

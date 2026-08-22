@@ -1,0 +1,26 @@
+# Copy to relay.toml and edit. Reload after changes with:
+#   docker kill -s HUP tgwebproxy      (or: kill -HUP <pid>)
+#
+# Reloadable: the secret list, site, max_streams and log_level. A restart is
+# needed for domain, listen, plain_listen, cert_dir and behind_proxy — the
+# domain is baked into every capability and the listeners are already bound.
+
+domain       = "proxy.example.com"
+listen       = ":443"
+plain_listen = ":80"
+cert_dir     = "certs"
+log_level    = "info"
+max_streams  = 64
+
+# Static cover site. Point it at something you would plausibly host.
+site = ""
+
+# One block per client. The label appears in logs; it is not a credential.
+# Generate a secret with: openssl rand -hex 16
+[[secret]]
+value = "000102030405060708090a0b0c0d0e0f"
+label = "phone"
+
+[[secret]]
+value = "0f0e0d0c0b0a09080706050403020100"
+label = "laptop"

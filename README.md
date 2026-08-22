@@ -66,6 +66,37 @@ The relay prints what to enter in the client:
 | `-diagnose` | `TGWP_DIAGNOSE` | off | one log line per request, never the capability |
 | `-log-level` | `TGWP_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
+For more than one client, use a configuration file instead of flags:
+
+```bash
+./tgwebproxy -config /etc/tgwebproxy/relay.toml
+```
+
+```toml
+domain = "proxy.example.com"
+
+[[secret]]
+value = "000102030405060708090a0b0c0d0e0f"
+label = "phone"
+
+[[secret]]
+value = "0f0e0d0c0b0a09080706050403020100"
+label = "laptop"
+```
+
+Each client gets its own secret, so one can be revoked without disturbing the
+others, and logs name the client rather than the address.
+[relay.example.toml](relay.example.toml) lists every setting. `-config` cannot
+be combined with `-domain` or `-secret`: the file is either the source of truth
+or it is not used at all.
+
+`SIGHUP` reloads the secret list, `site`, `max_streams` and `log_level` —
+`docker kill -s HUP <container>`. **Sessions belonging to a removed secret are
+disconnected**, while renaming a secret leaves its session alone. The domain,
+the listen addresses, `cert_dir` and `behind_proxy` need a restart; a change to
+them is refused, as is a file that does not parse, and the running
+configuration stays in place either way.
+
 `ee` (fake-TLS) secrets are rejected: Telegram Desktop marks them unsupported
 for this proxy type, since HTTPS already does what fake-TLS exists for.
 
@@ -185,7 +216,7 @@ is one static binary with no companion processes.
 | Carriers | WebSocket | WebSocket, HTTP long poll, and per-stream lanes |
 | Frame batching | one frame per message | up to 4096 frames per message |
 | Cover site | static directory or built-in | static directory or loopback upstream |
-| Secrets | one, several with a config file | up to 32 profiles |
+| Secrets | any number, hot reload and revocation | up to 32 profiles, restart to change |
 
 Where the reference is ahead, it is ahead for good reasons: the HTTP long-poll
 carriers keep working where WebSocket does not, and batching costs it nothing.

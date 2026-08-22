@@ -222,7 +222,10 @@ func (s *session) handleControl(f frame.Frame) error {
 		if len(f.Payload) > frame.MaxPingPayload {
 			return protoErrf("ping payload %d bytes", len(f.Payload))
 		}
-		return s.send(frame.Pong, 0, f.Payload)
+		// Deliberately unanswered. Telegram Desktop never sends Ping, and it
+		// has no handler for Pong: replying would be the protocol error that
+		// tears down the whole transport. Tolerate the frame, say nothing.
+		return nil
 	case frame.Bye:
 		s.opts.Logger.Info("peer said goodbye")
 		return errBye

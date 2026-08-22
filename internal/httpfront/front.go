@@ -6,12 +6,14 @@
 package httpfront
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,7 +26,8 @@ import (
 type Config struct {
 	// Domain is the normalised host the capability is bound to.
 	Domain string
-	Secret secret.Secret
+	// Keyring holds every secret this relay accepts.
+	Keyring *secret.Keyring
 	// SiteDir optionally replaces the built-in cover site with static files.
 	SiteDir string
 	Logger  *slog.Logger
@@ -39,10 +42,29 @@ type Config struct {
 
 // Handler serves the cover site, the bridge page, and the relay socket.
 type Handler struct {
-	cfg      Config
-	log      *slog.Logger
-	cover    http.Handler
-	upgrader websocket.Upgrader
+	domain      string
+	log         *slog.Logger
+	relay       relay.Options
+	behindProxy bool
+	diagnose    bool
+	upgrader    websocket.Upgrader
+	sessions    *sessionRegistry
+	// live is swapped whole on reload, so a request either sees the old
+	// snapshot or the new one and never a mixture.
+	live atomic.Pointer[liveState]
+}
+
+// Live is the part of the configuration that may change while the relay runs.
+type Live struct {
+	Keyring    *secret.Keyring
+	SiteDir    string
+	MaxStreams int
+}
+
+type liveState struct {
+	keyring    *secret.Keyring
+	cover      http.Handler
+	maxStreams int
 }
 
 // New fails on an unusable site directory: a broken cover site would be worse
@@ -51,35 +73,33 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Domain == "" {
 		return nil, errors.New("httpfront: domain is required")
 	}
-	if !cfg.Secret.Valid() {
-		return nil, errors.New("httpfront: secret is required")
+	if cfg.Keyring == nil || cfg.Keyring.Len() == 0 {
+		return nil, errors.New("httpfront: at least one secret is required")
+	}
+	if cfg.Keyring.Host() != cfg.Domain {
+		return nil, errors.New("httpfront: the keyring was built for a different host")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-
-	var cover http.Handler
-	if cfg.SiteDir != "" {
-		info, err := os.Stat(cfg.SiteDir)
-		if err != nil {
-			return nil, err
-		}
-		if !info.IsDir() {
-			return nil, errors.New("httpfront: site path is not a directory")
-		}
-		if _, err := os.Stat(filepath.Join(cfg.SiteDir, "index.html")); err != nil {
-			return nil, errors.New("httpfront: site directory has no index.html")
-		}
-		cover = http.FileServer(http.Dir(cfg.SiteDir))
-	} else {
-		cover = http.HandlerFunc(builtinCover)
+	cover, err := coverHandler(cfg.SiteDir)
+	if err != nil {
+		return nil, err
 	}
 
 	h := &Handler{
-		cfg:   cfg,
-		log:   cfg.Logger,
-		cover: cover,
+		domain:      cfg.Domain,
+		log:         cfg.Logger,
+		relay:       cfg.Relay,
+		behindProxy: cfg.BehindProxy,
+		diagnose:    cfg.Diagnose,
+		sessions:    newSessionRegistry(),
 	}
+	h.live.Store(&liveState{
+		keyring:    cfg.Keyring,
+		cover:      cover,
+		maxStreams: cfg.Relay.MaxStreams,
+	})
 	h.upgrader = websocket.Upgrader{
 		HandshakeTimeout: 15 * time.Second,
 		ReadBufferSize:   32 * 1024,
@@ -87,6 +107,54 @@ func New(cfg Config) (*Handler, error) {
 		CheckOrigin:      h.checkOrigin,
 	}
 	return h, nil
+}
+
+// Reload installs a new snapshot. Everything is validated before the running
+// state is touched, so a bad configuration leaves the relay as it was.
+func (h *Handler) Reload(next Live) error {
+	if next.Keyring == nil || next.Keyring.Len() == 0 {
+		return errors.New("httpfront: reload needs at least one secret")
+	}
+	if next.Keyring.Host() != h.domain {
+		return errors.New("httpfront: reload cannot change the domain")
+	}
+	cover, err := coverHandler(next.SiteDir)
+	if err != nil {
+		return err
+	}
+	maxStreams := next.MaxStreams
+	if maxStreams <= 0 {
+		maxStreams = h.live.Load().maxStreams
+	}
+	h.live.Store(&liveState{
+		keyring:    next.Keyring,
+		cover:      cover,
+		maxStreams: maxStreams,
+	})
+	if dropped := h.sessions.revokeMissing(next.Keyring); len(dropped) > 0 {
+		h.log.Info("secrets revoked, sessions closed", "labels", dropped)
+	}
+	h.log.Info("configuration reloaded", "secrets", next.Keyring.Len())
+	return nil
+}
+
+func (h *Handler) Domain() string { return h.domain }
+
+func coverHandler(siteDir string) (http.Handler, error) {
+	if siteDir == "" {
+		return http.HandlerFunc(builtinCover), nil
+	}
+	info, err := os.Stat(siteDir)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, errors.New("httpfront: site path is not a directory")
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "index.html")); err != nil {
+		return nil, errors.New("httpfront: site directory has no index.html")
+	}
+	return http.FileServer(http.Dir(siteDir)), nil
 }
 
 func builtinCover(w http.ResponseWriter, r *http.Request) {
@@ -109,13 +177,19 @@ func (h *Handler) checkOrigin(*http.Request) bool {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	authorized := h.authorized(r)
+	state := h.live.Load()
+	entry, authorized := h.match(state, r)
 	upgrade := websocket.IsWebSocketUpgrade(r)
 
-	if h.cfg.Diagnose {
+	if h.diagnose {
+		label := ""
+		if authorized {
+			label = entry.Label
+		}
 		h.log.Info("request",
 			"peer", h.peerLabel(r),
 			"authorized", authorized,
+			"label", label,
 			"upgrade", upgrade,
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -127,36 +201,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !authorized {
 			// Answer an unauthorised upgrade the way a site with no
 			// WebSocket endpoint would: with the page itself.
-			h.cover.ServeHTTP(w, r)
+			state.cover.ServeHTTP(w, r)
 			return
 		}
-		h.serveRelay(w, r)
+		h.serveRelay(w, r, state, entry)
 		return
 	}
 	if authorized {
-		h.serveBridge(w, r)
+		h.serveBridge(w, r, state)
 		return
 	}
-	h.cover.ServeHTTP(w, r)
+	state.cover.ServeHTTP(w, r)
 }
 
-// authorized runs the capability check for every request, authorised or not,
-// so the work done before the response is identical either way.
-func (h *Handler) authorized(r *http.Request) bool {
-	if r.Method != http.MethodGet {
-		return false
+// match runs the capability check for every request, authorised or not, so
+// the work done before the response is identical either way.
+func (h *Handler) match(state *liveState, r *http.Request) (secret.Entry, bool) {
+	if r.Method != http.MethodGet || r.URL.Path != "/" {
+		return secret.Entry{}, false
 	}
-	if r.URL.Path != "/" {
-		return false
-	}
-	return h.cfg.Secret.CheckCapability(h.cfg.Domain, r.URL.Query().Get("bridge"))
+	return state.keyring.Match(r.URL.Query().Get("bridge"))
 }
 
-func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, state *liveState) {
 	page, nonce, err := webassets.Bridge()
 	if err != nil {
 		h.log.Error("cannot render the bridge page", "error", err)
-		h.cover.ServeHTTP(w, r)
+		state.cover.ServeHTTP(w, r)
 		return
 	}
 	header := w.Header()
@@ -168,14 +239,14 @@ func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request) {
 		"default-src 'none'",
 		"script-src 'nonce-" + nonce + "'",
 		"style-src 'unsafe-inline'",
-		"connect-src wss://" + h.cfg.Domain,
+		"connect-src wss://" + h.domain,
 		"base-uri 'none'",
 		"form-action 'none'",
 	}, "; "))
 	w.Write(page)
 }
 
-func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request, state *liveState, entry secret.Entry) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.log.Debug("upgrade failed", "error", err)
@@ -184,15 +255,26 @@ func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request) {
 	// One Data frame plus its header is the largest legitimate message.
 	conn.SetReadLimit(2 * 1024 * 1024)
 
-	opts := h.cfg.Relay
-	opts.Secret = h.cfg.Secret
-	opts.Logger = h.log.With("peer", h.peerLabel(r))
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	// Closing the socket is not optional: the session's reader blocks in
+	// ReadMessage, and cancelling the context alone would never wake it.
+	id := h.sessions.add(entry, func() {
+		cancel()
+		_ = conn.Close()
+	})
+	defer h.sessions.remove(id)
 
-	if err := relay.Serve(r.Context(), &wsConn{conn: conn}, opts); err != nil {
+	opts := h.relay
+	opts.Secret = entry.Secret
+	opts.MaxStreams = state.maxStreams
+	opts.Logger = h.log.With("peer", h.peerLabel(r), "label", entry.Label)
+
+	if err := relay.Serve(ctx, &wsConn{conn: conn}, opts); err != nil {
 		if errors.Is(err, relay.ErrProtocol) {
-			h.log.Warn("session dropped", "reason", err)
+			h.log.Warn("session dropped", "reason", err, "label", entry.Label)
 		} else {
-			h.log.Debug("session ended", "reason", err)
+			h.log.Debug("session ended", "reason", err, "label", entry.Label)
 		}
 	}
 }
@@ -201,7 +283,7 @@ func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request) {
 // Behind a front end the socket address is always the front end, so the first
 // X-Forwarded-For hop is used instead.
 func (h *Handler) peerLabel(r *http.Request) string {
-	if h.cfg.BehindProxy {
+	if h.behindProxy {
 		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
 			first := forwarded
 			if idx := strings.Index(first, ","); idx >= 0 {

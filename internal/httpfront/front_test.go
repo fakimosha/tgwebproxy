@@ -28,10 +28,14 @@ func testHandler(t *testing.T, cfg func(*Config)) (*Handler, secret.Secret) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keys, err := secret.NewKeyring(testDomain, []secret.Entry{{Secret: sec, Label: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	c := Config{
-		Domain: testDomain,
-		Secret: sec,
-		Logger: quietLogger(),
+		Domain:  testDomain,
+		Keyring: keys,
+		Logger:  quietLogger(),
 	}
 	if cfg != nil {
 		cfg(&c)
@@ -164,8 +168,12 @@ func TestSiteDirectoryValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keys, err := secret.NewKeyring(testDomain, []secret.Entry{{Secret: sec, Label: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	empty := t.TempDir()
-	if _, err := New(Config{Domain: testDomain, Secret: sec, SiteDir: empty, Logger: quietLogger()}); err == nil {
+	if _, err := New(Config{Domain: testDomain, Keyring: keys, SiteDir: empty, Logger: quietLogger()}); err == nil {
 		t.Fatal("a site directory without index.html must be rejected")
 	}
 
@@ -173,7 +181,7 @@ func TestSiteDirectoryValidation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(good, "index.html"), []byte("<h1>hi</h1>"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(Config{Domain: testDomain, Secret: sec, SiteDir: good, Logger: quietLogger()})
+	h, err := New(Config{Domain: testDomain, Keyring: keys, SiteDir: good, Logger: quietLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -335,6 +335,48 @@ func TestBadSecretClosesStreamQuietly(t *testing.T) {
 	}
 }
 
+// The client has no handler for Pong, so answering its Ping would be the
+// protocol error that tears the transport down. The frame is tolerated and
+// left unanswered, and the session must survive it.
+func TestClientPingIsToleratedButUnanswered(t *testing.T) {
+	client, _ := startRelay(t, Options{Dial: echoDialer(t, upper)})
+	handshake(t, client)
+
+	client.writeFrame(t, frame.Ping, 0, []byte("are you there"))
+
+	// Nothing may come back, but the session must still work afterwards.
+	client.writeFrame(t, frame.Open, 1, nil)
+	hello, err := mtproto.NewHandshake(mtproto.Abridged, 2, testSecret(t).Obfuscation())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.writeFrame(t, frame.Data, 1, hello.Wire)
+	sealed := make([]byte, len("ping-survivor"))
+	hello.Encrypt.XORKeyStream(sealed, []byte("ping-survivor"))
+	client.writeFrame(t, frame.Data, 1, sealed)
+
+	// Window frames returning credit may arrive first; the payload is what
+	// matters here.
+	var got frame.Frame
+	for i := 0; i < 4; i++ {
+		got = client.readFrame(t)
+		if got.Type == frame.Data {
+			break
+		}
+		if got.Type != frame.Window {
+			t.Fatalf("after a Ping the relay sent %v on stream %d", got.Type, got.StreamID)
+		}
+	}
+	if got.Type != frame.Data || got.StreamID != 1 {
+		t.Fatalf("no Data came back after a Ping, last frame was %v", got.Type)
+	}
+	plain := make([]byte, len(got.Payload))
+	hello.Decrypt.XORKeyStream(plain, got.Payload)
+	if string(plain) != "PING-SURVIVOR" {
+		t.Fatalf("round trip after a Ping returned %q", plain)
+	}
+}
+
 func TestProtocolViolations(t *testing.T) {
 	cases := []struct {
 		name string

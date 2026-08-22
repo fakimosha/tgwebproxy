@@ -44,7 +44,7 @@ func NewServer(h *Handler, cfg ServerConfig) *Server {
 	if tlsConfig == nil && !cfg.Plaintext {
 		manager = &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(h.cfg.Domain),
+			HostPolicy: autocert.HostWhitelist(h.domain),
 			Cache:      autocert.DirCache(cfg.CertDir),
 		}
 		tlsConfig = manager.TLSConfig()
@@ -71,7 +71,7 @@ func NewServer(h *Handler, cfg ServerConfig) *Server {
 	}
 	if cfg.PlainListen != "" {
 		plainHandler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			target := "https://" + h.cfg.Domain + r.URL.RequestURI()
+			target := "https://" + h.domain + r.URL.RequestURI()
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		}))
 		if manager != nil {

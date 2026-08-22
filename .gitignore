@@ -4,3 +4,5 @@
 /probe.exe
 *.exe
 /certs/
+relay.toml
+*.local.toml

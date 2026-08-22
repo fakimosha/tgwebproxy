@@ -21,9 +21,13 @@ func diagnoseHandler(t *testing.T, buf *bytes.Buffer, behindProxy bool) (*Handle
 	if err != nil {
 		t.Fatal(err)
 	}
+	keys, err := secret.NewKeyring("proxy.example.com", []secret.Entry{{Secret: sec, Label: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	h, err := New(Config{
 		Domain:      "proxy.example.com",
-		Secret:      sec,
+		Keyring:     keys,
 		Logger:      captureLogger(buf),
 		BehindProxy: behindProxy,
 		Diagnose:    true,
@@ -113,11 +117,15 @@ func TestDiagnoseIsOffByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keys, err := secret.NewKeyring("proxy.example.com", []secret.Entry{{Secret: sec, Label: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var buf bytes.Buffer
 	h, err := New(Config{
-		Domain: "proxy.example.com",
-		Secret: sec,
-		Logger: captureLogger(&buf),
+		Domain:  "proxy.example.com",
+		Keyring: keys,
+		Logger:  captureLogger(&buf),
 	})
 	if err != nil {
 		t.Fatal(err)

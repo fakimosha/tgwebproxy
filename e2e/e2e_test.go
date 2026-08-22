@@ -166,10 +166,14 @@ func newBed(t *testing.T, transform func([]byte) []byte) (*bed, *atomic.Int64) {
 	}
 	addr, connections := fakeDC(t, transform)
 
+	keys, err := secret.NewKeyring(domain, []secret.Entry{{Secret: sec, Label: "e2e"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	handler, err := httpfront.New(httpfront.Config{
-		Domain: domain,
-		Secret: sec,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Domain:  domain,
+		Keyring: keys,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Relay: relay.Options{
 			Dial:         dcDialer(addr),
 			MaxStreams:   8,
