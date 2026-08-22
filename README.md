@@ -1,0 +1,207 @@
+# tgwebproxy
+
+Server for the **WEB** proxy type introduced in Telegram Desktop 7.1.
+
+Telegram shipped a new transport: the app runs a hidden WebView, loads a page
+from your domain over ordinary HTTPS, and tunnels multiplexed MTProto traffic
+through that page. To an observer the connection is a browser visiting a web
+site.
+
+Telegram also published a proof-of-concept server,
+[telegramdesktop/tproxy-server](https://github.com/telegramdesktop/tproxy-server).
+This is an independent implementation with different trade-offs — see
+[Compared to the reference server](#compared-to-the-reference-server).
+[PROTOCOL.md](PROTOCOL.md) is the specification recovered from the client
+sources here, cross-checked against the reference server's own protocol
+document.
+
+```
+Telegram Desktop ──hidden WebView──► bridge page (served by this relay)
+                                          │ WebSocket, same origin
+                                          ▼
+   capability gate ──► frame demultiplexer ──► obfuscated2 ──► Telegram DC
+        └──► cover site for everyone else
+```
+
+One static binary does all of it: the cover site, the bridge page, the
+WebSocket endpoint, TLS with automatic certificates, and the MTProxy
+underneath.
+
+## Quick start
+
+```bash
+go build -o tgwebproxy ./cmd/tgwebproxy
+```
+
+```bash
+./tgwebproxy -domain proxy.example.com -secret 000102030405060708090a0b0c0d0e0f -site ./mysite
+```
+
+Point the domain's A record at the host before starting: the certificate is
+obtained from Let's Encrypt on the first TLS handshake. Without `-secret` the
+relay generates one and prints it; without `-site` it serves a built-in page
+(replace it, see [Camouflage](#camouflage)).
+
+The relay prints what to enter in the client:
+
+```
+  Telegram Desktop -> Settings -> Advanced -> Connection type -> Add proxy -> WEB
+
+    Web proxy hostname : proxy.example.com
+    Secret             : 000102030405060708090a0b0c0d0e0f
+```
+
+### Configuration
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-domain` | `TGWP_DOMAIN` | — | domain the relay answers on (required) |
+| `-secret` | `TGWP_SECRET` | generated | 16-byte secret, hex or base64url; `dd` prefix selects padded intermediate |
+| `-site` | `TGWP_SITE` | built-in | directory with the cover site (`index.html` required) |
+| `-cert-dir` | `TGWP_CERT_DIR` | `certs` | ACME certificate cache |
+| `-listen` | `TGWP_LISTEN` | `:443` | TLS address (`127.0.0.1:4600` when behind a proxy) |
+| `-plain-listen` | `TGWP_PLAIN_LISTEN` | `:80` | HTTP→HTTPS redirect and HTTP-01; empty disables |
+| `-behind-proxy` | `TGWP_BEHIND_PROXY` | off | plain HTTP for a front end that terminates TLS |
+| `-max-streams` | — | 64 | concurrent MTProto streams per session |
+| `-diagnose` | `TGWP_DIAGNOSE` | off | one log line per request, never the capability |
+| `-log-level` | `TGWP_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+
+`ee` (fake-TLS) secrets are rejected: Telegram Desktop marks them unsupported
+for this proxy type, since HTTPS already does what fake-TLS exists for.
+
+### Docker
+
+```bash
+docker build -t tgwebproxy .
+```
+
+```bash
+docker run -d --name tgwebproxy -p 80:80 -p 443:443 -v certs:/certs \
+  -e TGWP_DOMAIN=proxy.example.com -e TGWP_SECRET=<hex> tgwebproxy
+```
+
+Keep the `/certs` volume, or every restart asks Let's Encrypt for a new
+certificate and hits its rate limit.
+
+### Behind nginx
+
+When something else already owns port 443, let it terminate TLS and proxy to
+the relay on the loopback:
+
+```bash
+./tgwebproxy -domain proxy.example.com -secret <hex> -behind-proxy
+```
+
+The relay listens on `127.0.0.1:4600` and obtains no certificate. The domain
+is still required — the capability is bound to it and the bridge page builds
+its `wss://` URL from it. The vhost must forward the WebSocket upgrade
+(`Upgrade`/`Connection` headers) and should keep the query string out of the
+access log, because the capability is a bearer credential.
+
+## Checking a deployment
+
+```bash
+go run ./cmd/tgwebproxy-probe -domain proxy.example.com -secret <hex>
+```
+
+The probe fetches the cover page, confirms that a wrong capability is answered
+byte-for-byte the same, opens the bridge and the socket, performs the client's
+transport handshake while enforcing every rule the client enforces, and then
+completes a real `req_pq_multi`/`resPQ` exchange with a Telegram data centre
+through the relay. A relay that passes is moving Telegram's own bytes end to
+end.
+
+## Camouflage
+
+The transport exists so that the domain looks ordinary. The relay is built
+around that:
+
+- The bridge page and the WebSocket both live on `/`. There is no second path
+  to find.
+- Every request runs the same constant-time capability check. A wrong or
+  missing capability produces the cover site — same status, same headers, same
+  bytes. There is no `403` and no timing difference; a test enforces this.
+- A stream whose MTProto handshake fails is closed without explanation.
+- Nothing is logged per request unless `-diagnose` is on, and even then the
+  capability is never written.
+
+What the relay cannot do is make the cover site convincing. Point `-site` at
+something you would plausibly host on that domain.
+
+## How it works
+
+| Package | Responsibility |
+|---|---|
+| `cmd/tgwebproxy` | flags, wiring, graceful shutdown |
+| `cmd/tgwebproxy-probe` | deployment check against a live relay |
+| `internal/httpfront` | TLS/ACME, capability gate, cover site, WebSocket upgrade |
+| `internal/webassets` | bridge page and built-in cover page |
+| `internal/frame` | the 8-byte frame and the client's limits |
+| `internal/relay` | session, stream multiplexing, flow control, keepalive |
+| `internal/mtproto` | obfuscated2 in both directions |
+| `internal/dc` | data-centre id → address |
+| `internal/secret` | secret parsing, bridge capability |
+| `internal/hostname` | the client's host normalisation |
+| `internal/twin` | a Telegram Desktop stand-in that enforces the client's rules |
+| `e2e` | the whole stack over real TLS against the twin |
+
+The design follows one principle: the client is unforgiving, so the relay must
+be too. A single unexpected frame makes Telegram Desktop drop the whole
+transport — every stream in it, not just the offending one. So the relay
+reserves window credit before it reads from a data centre, and refuses to send
+any frame type the client has no handler for.
+
+## Development
+
+```bash
+go test -race ./...
+```
+
+The suite pins the constants and the two capability vectors compiled into
+tdesktop, covers the handshake in both directions, the flow-control rules,
+the indistinguishability of the gate, and an end-to-end run over TLS against
+the client twin.
+
+## Compared to the reference server
+
+Telegram's [tproxy-server](https://github.com/telegramdesktop/tproxy-server) is
+the reference implementation, and it is the one to read if you want the
+protocol from the source. It is also a proof of concept with **no license
+file**, which means no one may legally redistribute or fork it.
+
+The two answer different questions. The reference relay terminates the carrier
+and hands the demultiplexed streams to a **stock official MTProxy running
+beside it**; its installer builds MTProxy from a pinned commit, installs Caddy,
+four systemd units and nftables rules, and targets x86_64 Debian or Ubuntu.
+This relay speaks obfuscated2 itself and dials the data centres directly, so it
+is one static binary with no companion processes.
+
+| | this relay | tproxy-server |
+|---|---|---|
+| License | MIT | none (all rights reserved) |
+| Data-centre leg | built in | delegated to a stock MTProxy |
+| Needs Caddy/nginx | no, ACME built in | yes, Caddy owns 443 |
+| Deployment | any Go target, Docker | x86_64 Debian/Ubuntu installer |
+| Carriers | WebSocket | WebSocket, HTTP long poll, and per-stream lanes |
+| Frame batching | one frame per message | up to 4096 frames per message |
+| Cover site | static directory or built-in | static directory or loopback upstream |
+| Secrets | one, several with a config file | up to 32 profiles |
+
+Where the reference is ahead, it is ahead for good reasons: the HTTP long-poll
+carriers keep working where WebSocket does not, and batching costs it nothing.
+Both are worth having here and neither is implemented yet.
+
+## Status
+
+Deployed and verified end to end: the probe completes `req_pq_multi` against
+every production data centre through a live relay. The protocol was read off
+the `dev` branch of tdesktop at release 7.1.1, then checked against the
+reference server's `PROTOCOL.md`; the frame format, the limits and the
+capability vectors agree.
+
+Not yet driven by a running Telegram Desktop. The twin follows the client's
+source and the reference's specification, but it is still a twin.
+
+## License
+
+MIT.

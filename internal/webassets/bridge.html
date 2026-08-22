@@ -1,0 +1,170 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Status</title>
+<style>
+body{font:15px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6f8;color:#17212b}
+main{width:min(30rem,calc(100% - 3rem));padding:1.5rem;text-align:center}
+h1{font-size:1.25rem;font-weight:600;margin:0 0 .5rem}
+#state{color:#5288c1;margin:0}
+.counters{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin:1.5rem 0 0;text-align:left}
+.counters div{padding:.85rem;border:1px solid #dce3e9;border-radius:.7rem;background:#fff}
+.counters dt{font-size:.75rem;color:#6c7883}
+.counters dd{margin:.3rem 0 0;font-size:1.05rem;font-weight:600}
+</style>
+<main>
+  <h1>Connection</h1>
+  <p id="state">Starting…</p>
+  <dl class="counters">
+    <div><dt>Sent</dt><dd id="up">0 B</dd></div>
+    <div><dt>Received</dt><dd id="down">0 B</dd></div>
+  </dl>
+</main>
+<script nonce="__NONCE__">
+(() => {
+"use strict";
+
+// Byte-for-byte forwarder; it never parses a frame. The relay emits exactly one
+// frame per WebSocket message, so one-to-one forwarding gives the client the one
+// frame per native message that tdesktop's WebView carrier expects.
+
+const stateNode = document.getElementById("state");
+const upNode = document.getElementById("up");
+const downNode = document.getElementById("down");
+
+let up = 0, down = 0, upShown = -1, downShown = -1;
+const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+const human = value => {
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return value.toFixed(unit && value < 100 ? 1 : 0) + " " + units[unit];
+};
+setInterval(() => {
+  if (up !== upShown) { upNode.textContent = human(up); upShown = up; }
+  if (down !== downShown) { downNode.textContent = human(down); downShown = down; }
+}, 1000);
+
+// Telegram Desktop drives this page either as the top document of its hidden
+// WebView or inside an iframe in a real browser tab; only the plumbing differs.
+let carrier = null;
+const pendingToClient = [];
+
+const toClient = buffer => {
+  if (!carrier) { pendingToClient.push(buffer); return; }
+  carrier.send(buffer);
+};
+
+const flushToClient = () => {
+  while (pendingToClient.length) carrier.send(pendingToClient.shift());
+};
+
+const socket = new WebSocket(
+  (location.protocol === "https:" ? "wss://" : "ws://") +
+  location.host + location.pathname + location.search);
+socket.binaryType = "arraybuffer";
+
+const pendingToRelay = [];
+let socketReady = false;
+
+const toRelay = buffer => {
+  if (!socketReady) { pendingToRelay.push(buffer); return; }
+  up += buffer.byteLength;
+  socket.send(buffer);
+};
+
+const setState = (text, status) => {
+  stateNode.textContent = text;
+  if (carrier && carrier.status) carrier.status(status);
+};
+
+socket.onopen = () => {
+  socketReady = true;
+  while (pendingToRelay.length) {
+    const buffer = pendingToRelay.shift();
+    up += buffer.byteLength;
+    socket.send(buffer);
+  }
+  setState("Connected. Keep this page open.", "connected");
+};
+socket.onmessage = event => {
+  if (!(event.data instanceof ArrayBuffer)) return;
+  down += event.data.byteLength;
+  toClient(event.data);
+};
+socket.onerror = () => setState("Connection failed.", "failed");
+socket.onclose = () => {
+  socketReady = false;
+  setState("Disconnected.", "failed");
+  if (carrier && carrier.close) carrier.close();
+};
+
+const startWebviewCarrier = () => {
+  const bridge = window.TelegramWebProxy;
+  if (!bridge) return false;
+
+  const hash = location.hash.slice(1);
+  const marker = "android=";
+  const at = hash.indexOf(marker);
+  if (at < 0) return false;
+  const nonce = hash.slice(at + marker.length);
+  if (!nonce) return false;
+
+  bridge.onmessage = event => {
+    if (event && event.data instanceof ArrayBuffer) toRelay(event.data);
+  };
+  carrier = {
+    send: buffer => bridge.postMessage(buffer),
+    status: state => bridge.postMessage(JSON.stringify({ t: "status", state })),
+    close: () => bridge.postMessage(JSON.stringify({ t: "close" })),
+  };
+  // tproxy-android-init handshake; the client answers with its Hello frame.
+  bridge.postMessage(JSON.stringify({ t: "tproxy-android-init", v: 1, nonce }));
+  flushToClient();
+  return true;
+};
+
+const startIframeCarrier = () => {
+  addEventListener("message", event => {
+    const data = event.data;
+    if (carrier || !data || data.t !== "tproxy-init" || data.v !== 1) return;
+    const port = event.ports && event.ports[0];
+    if (!port) return;
+    port.onmessage = portEvent => {
+      const payload = portEvent.data;
+      if (payload instanceof ArrayBuffer) { toRelay(payload); return; }
+      if (payload && payload.t === "close") socket.close();
+    };
+    port.start();
+    carrier = {
+      send: buffer => port.postMessage(buffer, [buffer]),
+      status: state => port.postMessage({ t: "status", state }),
+      close: () => port.postMessage({ t: "close" }),
+    };
+    flushToClient();
+    carrier.status(socketReady ? "connected" : "connecting");
+    // The host tab paints its own counters from these deltas.
+    setInterval(() => {
+      if (!carrier) return;
+      const deltaUp = up - reportedUp, deltaDown = down - reportedDown;
+      if (deltaUp <= 0 && deltaDown <= 0) return;
+      reportedUp = up; reportedDown = down;
+      port.postMessage({ t: "traffic", up: deltaUp, down: deltaDown });
+    }, 1000);
+  });
+  return true;
+};
+
+let reportedUp = 0, reportedDown = 0;
+
+if (window.top === window) {
+  if (!startWebviewCarrier()) {
+    // The WebView injects its bridge before navigation, so a missing bridge
+    // here means a human opened the page directly. Say nothing useful.
+    setState("Nothing to see here.", "failed");
+  }
+} else {
+  startIframeCarrier();
+  setState("Connecting…", "connecting");
+}
+})();
+</script>

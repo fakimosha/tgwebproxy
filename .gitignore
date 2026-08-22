@@ -1,0 +1,6 @@
+/tgwebproxy
+/tgwebproxy.exe
+/probe
+/probe.exe
+*.exe
+/certs/
