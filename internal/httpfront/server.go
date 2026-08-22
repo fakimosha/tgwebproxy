@@ -44,7 +44,7 @@ func NewServer(h *Handler, cfg ServerConfig) *Server {
 	if tlsConfig == nil && !cfg.Plaintext {
 		manager = &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(h.domain),
+			HostPolicy: autocert.HostWhitelist(h.Domains()...),
 			Cache:      autocert.DirCache(cfg.CertDir),
 		}
 		tlsConfig = manager.TLSConfig()
@@ -71,7 +71,9 @@ func NewServer(h *Handler, cfg ServerConfig) *Server {
 	}
 	if cfg.PlainListen != "" {
 		plainHandler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			target := "https://" + h.domain + r.URL.RequestURI()
+			// Redirect to the name that was asked for when we serve it, so a
+			// multi-domain relay does not bounce every visitor to one site.
+			target := "https://" + redirectHost(h, r.Host) + r.URL.RequestURI()
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		}))
 		if manager != nil {
@@ -116,6 +118,13 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.shutdown()
 	return nil
+}
+
+// redirectHost keeps a multi-domain relay from bouncing every visitor to one
+// site, while an unknown name goes to the first domain we serve.
+func redirectHost(h *Handler, host string) string {
+	domain, _ := h.live.Load().lookup(host)
+	return domain.name
 }
 
 func (s *Server) shutdown() {

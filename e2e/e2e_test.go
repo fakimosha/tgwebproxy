@@ -171,8 +171,7 @@ func newBed(t *testing.T, transform func([]byte) []byte) (*bed, *atomic.Int64) {
 		t.Fatal(err)
 	}
 	handler, err := httpfront.New(httpfront.Config{
-		Domain:  domain,
-		Keyring: keys,
+		Domains: []httpfront.Domain{{Name: domain, Keyring: keys}},
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Relay: relay.Options{
 			Dial:         dcDialer(addr),

@@ -59,7 +59,7 @@ func servesBridge(t *testing.T, h *Handler, capability string) bool {
 
 func handlerWith(t *testing.T, keys *secret.Keyring) *Handler {
 	t.Helper()
-	h, err := New(Config{Domain: testDomain, Keyring: keys, Logger: quietLogger()})
+	h, err := New(Config{Domains: []Domain{{Name: testDomain, Keyring: keys}}, Logger: quietLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestReloadAddsAndRemovesSecrets(t *testing.T) {
 	if servesBridge(t, h, capB) {
 		t.Fatal("an unconfigured secret must not work before the reload")
 	}
-	if err := h.Reload(Live{Keyring: ring(t, [2]string{secretB, "laptop"})}); err != nil {
+	if err := h.Reload(Live{Domains: []Domain{{Name: testDomain, Keyring: ring(t, [2]string{secretB, "laptop"})}}}); err != nil {
 		t.Fatalf("Reload: %v", err)
 	}
 	if !servesBridge(t, h, capB) {
@@ -98,9 +98,9 @@ func TestReloadAddsAndRemovesSecrets(t *testing.T) {
 // way to take the relay down.
 func TestReloadRefusalKeepsTheRunningConfiguration(t *testing.T) {
 	for name, next := range map[string]Live{
-		"no keyring":       {},
-		"unusable siteDir": {Keyring: ring(t, [2]string{secretA, "phone"}), SiteDir: t.TempDir()},
-		"different domain": {Keyring: foreignRing(t)},
+		"no domains":       {},
+		"unusable siteDir": {Domains: []Domain{{Name: testDomain, Keyring: ring(t, [2]string{secretA, "phone"}), SiteDir: t.TempDir()}}},
+		"different domain": {Domains: []Domain{{Name: "other.example.com", Keyring: foreignRing(t)}}},
 	} {
 		h := handlerWith(t, ring(t, [2]string{secretA, "phone"}))
 		if err := h.Reload(next); err == nil {
@@ -177,7 +177,7 @@ func TestReloadDropsSessionsOfRemovedSecrets(t *testing.T) {
 	revoked := openSession(t, server, capabilityOf(t, secretA))
 	kept := openSession(t, server, capabilityOf(t, secretB))
 
-	if err := h.Reload(Live{Keyring: ring(t, [2]string{secretB, "laptop"})}); err != nil {
+	if err := h.Reload(Live{Domains: []Domain{{Name: testDomain, Keyring: ring(t, [2]string{secretB, "laptop"})}}}); err != nil {
 		t.Fatalf("Reload: %v", err)
 	}
 
@@ -196,7 +196,7 @@ func TestReloadKeepsSessionsWhenOnlyTheLabelChanges(t *testing.T) {
 	defer server.Close()
 
 	conn := openSession(t, server, capabilityOf(t, secretA))
-	if err := h.Reload(Live{Keyring: ring(t, [2]string{secretA, "renamed"})}); err != nil {
+	if err := h.Reload(Live{Domains: []Domain{{Name: testDomain, Keyring: ring(t, [2]string{secretA, "renamed"})}}}); err != nil {
 		t.Fatalf("Reload: %v", err)
 	}
 	if !stillOpen(t, conn) {

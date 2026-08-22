@@ -15,20 +15,21 @@ type sessionRegistry struct {
 }
 
 type liveSession struct {
-	entry secret.Entry
-	stop  func()
+	domain string
+	entry  secret.Entry
+	stop   func()
 }
 
 func newSessionRegistry() *sessionRegistry {
 	return &sessionRegistry{live: make(map[uint64]liveSession)}
 }
 
-func (s *sessionRegistry) add(entry secret.Entry, stop func()) uint64 {
+func (s *sessionRegistry) add(domain string, entry secret.Entry, stop func()) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.next++
 	id := s.next
-	s.live[id] = liveSession{entry: entry, stop: stop}
+	s.live[id] = liveSession{domain: domain, entry: entry, stop: stop}
 	return id
 }
 
@@ -38,16 +39,17 @@ func (s *sessionRegistry) remove(id uint64) {
 	delete(s.live, id)
 }
 
-// revokeMissing stops every session whose secret is absent from k and returns
-// the labels it stopped. Membership is by secret, so a renamed entry survives.
-func (s *sessionRegistry) revokeMissing(k *secret.Keyring) []string {
+// revokeMissing stops every session whose secret is no longer configured for
+// its own domain, and returns the labels it stopped. Membership is by secret,
+// so a renamed entry survives.
+func (s *sessionRegistry) revokeMissing(state *liveState) []string {
 	s.mu.Lock()
 	var (
 		stops   []func()
 		dropped []string
 	)
 	for id, session := range s.live {
-		if k.Contains(session.entry) {
+		if domain, served := state.byHost[session.domain]; served && domain.keyring.Contains(session.entry) {
 			continue
 		}
 		stops = append(stops, session.stop)

@@ -8,6 +8,7 @@ package httpfront
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,12 +25,9 @@ import (
 )
 
 type Config struct {
-	// Domain is the normalised host the capability is bound to.
-	Domain string
-	// Keyring holds every secret this relay accepts.
-	Keyring *secret.Keyring
-	// SiteDir optionally replaces the built-in cover site with static files.
-	SiteDir string
+	// Domains lists every name this relay answers on. Capabilities are bound
+	// to a name, so each domain carries its own keyring and cover site.
+	Domains []Domain
 	Logger  *slog.Logger
 	Relay   relay.Options
 	// BehindProxy marks that a trusted front end terminates TLS. Only then is
@@ -40,9 +38,15 @@ type Config struct {
 	Diagnose bool
 }
 
+// Domain is one served name.
+type Domain struct {
+	Name    string
+	Keyring *secret.Keyring
+	SiteDir string
+}
+
 // Handler serves the cover site, the bridge page, and the relay socket.
 type Handler struct {
-	domain      string
 	log         *slog.Logger
 	relay       relay.Options
 	behindProxy bool
@@ -55,51 +59,45 @@ type Handler struct {
 }
 
 // Live is the part of the configuration that may change while the relay runs.
+// The set of names is not in it: it is fixed by the ACME host policy and by
+// the capabilities already handed out.
 type Live struct {
-	Keyring    *secret.Keyring
-	SiteDir    string
+	Domains    []Domain
 	MaxStreams int
 }
 
+type domainState struct {
+	name    string
+	keyring *secret.Keyring
+	cover   http.Handler
+}
+
 type liveState struct {
-	keyring    *secret.Keyring
-	cover      http.Handler
+	byHost map[string]*domainState
+	// fallback answers a request for a name we do not serve. It is the first
+	// configured domain's cover site: an unknown Host must still look like an
+	// ordinary web server, not like something that knows it is being probed.
+	fallback   *domainState
 	maxStreams int
 }
 
-// New fails on an unusable site directory: a broken cover site would be worse
-// than no relay at all.
 func New(cfg Config) (*Handler, error) {
-	if cfg.Domain == "" {
-		return nil, errors.New("httpfront: domain is required")
-	}
-	if cfg.Keyring == nil || cfg.Keyring.Len() == 0 {
-		return nil, errors.New("httpfront: at least one secret is required")
-	}
-	if cfg.Keyring.Host() != cfg.Domain {
-		return nil, errors.New("httpfront: the keyring was built for a different host")
-	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	cover, err := coverHandler(cfg.SiteDir)
+	state, err := buildState(cfg.Domains, cfg.Relay.MaxStreams)
 	if err != nil {
 		return nil, err
 	}
 
 	h := &Handler{
-		domain:      cfg.Domain,
 		log:         cfg.Logger,
 		relay:       cfg.Relay,
 		behindProxy: cfg.BehindProxy,
 		diagnose:    cfg.Diagnose,
 		sessions:    newSessionRegistry(),
 	}
-	h.live.Store(&liveState{
-		keyring:    cfg.Keyring,
-		cover:      cover,
-		maxStreams: cfg.Relay.MaxStreams,
-	})
+	h.live.Store(state)
 	h.upgrader = websocket.Upgrader{
 		HandshakeTimeout: 15 * time.Second,
 		ReadBufferSize:   32 * 1024,
@@ -112,33 +110,89 @@ func New(cfg Config) (*Handler, error) {
 // Reload installs a new snapshot. Everything is validated before the running
 // state is touched, so a bad configuration leaves the relay as it was.
 func (h *Handler) Reload(next Live) error {
-	if next.Keyring == nil || next.Keyring.Len() == 0 {
-		return errors.New("httpfront: reload needs at least one secret")
+	current := h.live.Load()
+	maxStreams := next.MaxStreams
+	if maxStreams <= 0 {
+		maxStreams = current.maxStreams
 	}
-	if next.Keyring.Host() != h.domain {
-		return errors.New("httpfront: reload cannot change the domain")
-	}
-	cover, err := coverHandler(next.SiteDir)
+	state, err := buildState(next.Domains, maxStreams)
 	if err != nil {
 		return err
 	}
-	maxStreams := next.MaxStreams
-	if maxStreams <= 0 {
-		maxStreams = h.live.Load().maxStreams
+	if len(state.byHost) != len(current.byHost) {
+		return errors.New("httpfront: reload cannot add or remove a domain")
 	}
-	h.live.Store(&liveState{
-		keyring:    next.Keyring,
-		cover:      cover,
-		maxStreams: maxStreams,
-	})
-	if dropped := h.sessions.revokeMissing(next.Keyring); len(dropped) > 0 {
+	for host := range state.byHost {
+		if _, served := current.byHost[host]; !served {
+			return fmt.Errorf("httpfront: reload cannot introduce the domain %q", host)
+		}
+	}
+
+	h.live.Store(state)
+	if dropped := h.sessions.revokeMissing(state); len(dropped) > 0 {
 		h.log.Info("secrets revoked, sessions closed", "labels", dropped)
 	}
-	h.log.Info("configuration reloaded", "secrets", next.Keyring.Len())
+	h.log.Info("configuration reloaded", "domains", len(state.byHost))
 	return nil
 }
 
-func (h *Handler) Domain() string { return h.domain }
+// Domains lists the served names, in configuration order.
+func (h *Handler) Domains() []string {
+	state := h.live.Load()
+	names := make([]string, 0, len(state.byHost))
+	for _, d := range state.order() {
+		names = append(names, d.name)
+	}
+	return names
+}
+
+func (s *liveState) order() []*domainState {
+	out := make([]*domainState, 0, len(s.byHost))
+	if s.fallback != nil {
+		out = append(out, s.fallback)
+	}
+	for _, d := range s.byHost {
+		if d != s.fallback {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func buildState(domains []Domain, maxStreams int) (*liveState, error) {
+	if len(domains) == 0 {
+		return nil, errors.New("httpfront: at least one domain is required")
+	}
+	state := &liveState{
+		byHost:     make(map[string]*domainState, len(domains)),
+		maxStreams: maxStreams,
+	}
+	for _, d := range domains {
+		if d.Name == "" {
+			return nil, errors.New("httpfront: a domain needs a name")
+		}
+		if d.Keyring == nil || d.Keyring.Len() == 0 {
+			return nil, fmt.Errorf("httpfront: domain %q has no secrets", d.Name)
+		}
+		if d.Keyring.Host() != d.Name {
+			return nil, fmt.Errorf("httpfront: the keyring for %q was built for %q",
+				d.Name, d.Keyring.Host())
+		}
+		if _, clash := state.byHost[d.Name]; clash {
+			return nil, fmt.Errorf("httpfront: domain %q appears twice", d.Name)
+		}
+		cover, err := coverHandler(d.SiteDir)
+		if err != nil {
+			return nil, fmt.Errorf("httpfront: domain %q: %w", d.Name, err)
+		}
+		entry := &domainState{name: d.Name, keyring: d.Keyring, cover: cover}
+		state.byHost[d.Name] = entry
+		if state.fallback == nil {
+			state.fallback = entry
+		}
+	}
+	return state, nil
+}
 
 func coverHandler(siteDir string) (http.Handler, error) {
 	if siteDir == "" {
@@ -149,10 +203,10 @@ func coverHandler(siteDir string) (http.Handler, error) {
 		return nil, err
 	}
 	if !info.IsDir() {
-		return nil, errors.New("httpfront: site path is not a directory")
+		return nil, errors.New("site path is not a directory")
 	}
 	if _, err := os.Stat(filepath.Join(siteDir, "index.html")); err != nil {
-		return nil, errors.New("httpfront: site directory has no index.html")
+		return nil, errors.New("site directory has no index.html")
 	}
 	return http.FileServer(http.Dir(siteDir)), nil
 }
@@ -178,7 +232,11 @@ func (h *Handler) checkOrigin(*http.Request) bool {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	state := h.live.Load()
-	entry, authorized := h.match(state, r)
+	domain, served := state.lookup(r.Host)
+	entry, authorized := secret.Entry{}, false
+	if served {
+		entry, authorized = h.match(domain, r)
+	}
 	upgrade := websocket.IsWebSocketUpgrade(r)
 
 	if h.diagnose {
@@ -188,6 +246,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.log.Info("request",
 			"peer", h.peerLabel(r),
+			"domain", domain.name,
 			"authorized", authorized,
 			"label", label,
 			"upgrade", upgrade,
@@ -201,33 +260,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !authorized {
 			// Answer an unauthorised upgrade the way a site with no
 			// WebSocket endpoint would: with the page itself.
-			state.cover.ServeHTTP(w, r)
+			domain.cover.ServeHTTP(w, r)
 			return
 		}
-		h.serveRelay(w, r, state, entry)
+		h.serveRelay(w, r, state, domain, entry)
 		return
 	}
 	if authorized {
-		h.serveBridge(w, r, state)
+		h.serveBridge(w, r, domain)
 		return
 	}
-	state.cover.ServeHTTP(w, r)
+	domain.cover.ServeHTTP(w, r)
+}
+
+// lookup resolves the request's Host. An unserved name still gets a cover
+// site — an error saying "wrong host" would answer the prober's question — but
+// the second result is false and no capability is honoured for it.
+//
+// With a single domain there is nothing to route, so any Host resolves to it.
+// That keeps the relay working behind a front end that rewrites the header,
+// which is a common and otherwise silent misconfiguration; with several
+// domains the header is the only thing telling them apart, so it must match.
+func (s *liveState) lookup(host string) (*domainState, bool) {
+	if len(s.byHost) == 1 {
+		return s.fallback, true
+	}
+	name := host
+	if colon := strings.LastIndex(name, ":"); colon > 0 && !strings.Contains(name[colon:], "]") {
+		name = name[:colon]
+	}
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	if domain, ok := s.byHost[name]; ok {
+		return domain, true
+	}
+	return s.fallback, false
 }
 
 // match runs the capability check for every request, authorised or not, so
 // the work done before the response is identical either way.
-func (h *Handler) match(state *liveState, r *http.Request) (secret.Entry, bool) {
+func (h *Handler) match(domain *domainState, r *http.Request) (secret.Entry, bool) {
 	if r.Method != http.MethodGet || r.URL.Path != "/" {
 		return secret.Entry{}, false
 	}
-	return state.keyring.Match(r.URL.Query().Get("bridge"))
+	return domain.keyring.Match(r.URL.Query().Get("bridge"))
 }
 
-func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, state *liveState) {
+func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, domain *domainState) {
 	page, nonce, err := webassets.Bridge()
 	if err != nil {
 		h.log.Error("cannot render the bridge page", "error", err)
-		state.cover.ServeHTTP(w, r)
+		domain.cover.ServeHTTP(w, r)
 		return
 	}
 	header := w.Header()
@@ -239,14 +321,14 @@ func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, state *liv
 		"default-src 'none'",
 		"script-src 'nonce-" + nonce + "'",
 		"style-src 'unsafe-inline'",
-		"connect-src wss://" + h.domain,
+		"connect-src wss://" + domain.name,
 		"base-uri 'none'",
 		"form-action 'none'",
 	}, "; "))
 	w.Write(page)
 }
 
-func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request, state *liveState, entry secret.Entry) {
+func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request, state *liveState, domain *domainState, entry secret.Entry) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.log.Debug("upgrade failed", "error", err)
@@ -259,7 +341,7 @@ func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request, state *live
 	defer cancel()
 	// Closing the socket is not optional: the session's reader blocks in
 	// ReadMessage, and cancelling the context alone would never wake it.
-	id := h.sessions.add(entry, func() {
+	id := h.sessions.add(domain.name, entry, func() {
 		cancel()
 		_ = conn.Close()
 	})
@@ -268,7 +350,7 @@ func (h *Handler) serveRelay(w http.ResponseWriter, r *http.Request, state *live
 	opts := h.relay
 	opts.Secret = entry.Secret
 	opts.MaxStreams = state.maxStreams
-	opts.Logger = h.log.With("peer", h.peerLabel(r), "label", entry.Label)
+	opts.Logger = h.log.With("peer", h.peerLabel(r), "domain", domain.name, "label", entry.Label)
 
 	if err := relay.Serve(ctx, &wsConn{conn: conn}, opts); err != nil {
 		if errors.Is(err, relay.ErrProtocol) {

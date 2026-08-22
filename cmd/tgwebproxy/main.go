@@ -62,14 +62,12 @@ func run() error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
-	keyring, err := secret.NewKeyring(cfg.Domain, cfg.Entries)
+	domains, err := buildDomains(cfg)
 	if err != nil {
 		return err
 	}
 	handler, err := httpfront.New(httpfront.Config{
-		Domain:      cfg.Domain,
-		Keyring:     keyring,
-		SiteDir:     cfg.Site,
+		Domains:     domains,
 		Logger:      log,
 		BehindProxy: cfg.BehindProxy,
 		Diagnose:    cfg.Diagnose,
@@ -106,10 +104,21 @@ func run() error {
 
 	log.Info("relay listening",
 		"address", serverCfg.Listen,
-		"domain", cfg.Domain,
-		"secrets", len(cfg.Entries),
+		"domains", cfg.DomainNames(),
 		"behind_proxy", cfg.BehindProxy)
 	return server.Run(ctx)
+}
+
+func buildDomains(cfg *config.Config) ([]httpfront.Domain, error) {
+	out := make([]httpfront.Domain, 0, len(cfg.Domains))
+	for _, d := range cfg.Domains {
+		keyring, err := secret.NewKeyring(d.Name, d.Entries)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, httpfront.Domain{Name: d.Name, Keyring: keyring, SiteDir: d.Site})
+	}
+	return out, nil
 }
 
 type flagValues struct {
@@ -167,16 +176,18 @@ func resolveConfig(path string, flags flagValues) (*config.Config, error) {
 	}
 
 	return &config.Config{
-		Domain:      normalized,
+		Domains: []config.Domain{{
+			Name:    normalized,
+			Site:    flags.siteDir,
+			Entries: []secret.Entry{{Secret: sec, Label: "default"}},
+		}},
 		Listen:      listen,
 		PlainListen: flags.plainListen,
 		CertDir:     flags.certDir,
-		Site:        flags.siteDir,
 		BehindProxy: flags.behindProxy,
 		Diagnose:    flags.diagnose,
 		LogLevel:    level,
 		MaxStreams:  flags.maxStreams,
-		Entries:     []secret.Entry{{Secret: sec, Label: "default"}},
 	}, nil
 }
 
@@ -201,14 +212,13 @@ func watchReloads(ctx context.Context, path string, current *config.Config, hand
 				log.Error("reload refused", "error", err)
 				continue
 			}
-			keyring, err := secret.NewKeyring(next.Domain, next.Entries)
+			domains, err := buildDomains(next)
 			if err != nil {
 				log.Error("reload refused", "error", err)
 				continue
 			}
 			if err := handler.Reload(httpfront.Live{
-				Keyring:    keyring,
-				SiteDir:    next.Site,
+				Domains:    domains,
 				MaxStreams: next.MaxStreams,
 			}); err != nil {
 				log.Error("reload refused", "error", err)
@@ -222,10 +232,12 @@ func watchReloads(ctx context.Context, path string, current *config.Config, hand
 func printConnectionDetails(cfg *config.Config) {
 	fmt.Println()
 	fmt.Println("  Telegram Desktop -> Settings -> Advanced -> Connection type -> Add proxy -> WEB")
-	fmt.Println()
-	fmt.Printf("    Web proxy hostname : %s\n", cfg.Domain)
-	for _, entry := range cfg.Entries {
-		fmt.Printf("    Secret (%s) : %s\n", entry.Label, entry.Secret.Hex())
+	for _, domain := range cfg.Domains {
+		fmt.Println()
+		fmt.Printf("    Web proxy hostname : %s\n", domain.Name)
+		for _, entry := range domain.Entries {
+			fmt.Printf("    Secret (%s) : %s\n", entry.Label, entry.Secret.Hex())
+		}
 	}
 	fmt.Println()
 }

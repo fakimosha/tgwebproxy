@@ -26,8 +26,7 @@ func diagnoseHandler(t *testing.T, buf *bytes.Buffer, behindProxy bool) (*Handle
 		t.Fatal(err)
 	}
 	h, err := New(Config{
-		Domain:      "proxy.example.com",
-		Keyring:     keys,
+		Domains:     []Domain{{Name: "proxy.example.com", Keyring: keys}},
 		Logger:      captureLogger(buf),
 		BehindProxy: behindProxy,
 		Diagnose:    true,
@@ -123,8 +122,7 @@ func TestDiagnoseIsOffByDefault(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	h, err := New(Config{
-		Domain:  "proxy.example.com",
-		Keyring: keys,
+		Domains: []Domain{{Name: "proxy.example.com", Keyring: keys}},
 		Logger:  captureLogger(&buf),
 	})
 	if err != nil {

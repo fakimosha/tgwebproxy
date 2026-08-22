@@ -90,12 +90,45 @@ others, and logs name the client rather than the address.
 be combined with `-domain` or `-secret`: the file is either the source of truth
 or it is not used at all.
 
-`SIGHUP` reloads the secret list, `site`, `max_streams` and `log_level` —
-`docker kill -s HUP <container>`. **Sessions belonging to a removed secret are
-disconnected**, while renaming a secret leaves its session alone. The domain,
-the listen addresses, `cert_dir` and `behind_proxy` need a restart; a change to
-them is refused, as is a file that does not parse, and the running
-configuration stays in place either way.
+### Several domains
+
+One process can serve any number of names, each with its own secrets and cover
+site:
+
+```toml
+[[host]]
+name = "files.example.com"
+site = "/srv/site-files"
+  [[host.secret]]
+  value = "000102030405060708090a0b0c0d0e0f"
+  label = "phone"
+
+[[host]]
+name = "media.example.net"
+site = "/srv/site-media"
+  [[host.secret]]
+  value = "0f0e0d0c0b0a09080706050403020100"
+  label = "laptop"
+```
+
+Blocking a proxy by domain name is cheap, and no amount of camouflage inside
+the connection changes that. What helps is making domains plural and cheap to
+replace: when one is blocked the user edits a single field in the client, keeps
+the same secret, and the server is not touched. One certificate is obtained per
+name, and a capability minted for one name is refused by the others.
+
+The two shapes cannot be mixed: either a top-level `domain` or `[[host]]`
+blocks. With several domains the `Host` header is what tells them apart, so a
+front end must pass it through unchanged; with a single domain any `Host` is
+accepted, because there is nothing to route.
+
+`SIGHUP` reloads the secrets and cover site of every domain, plus
+`max_streams` and `log_level` — `docker kill -s HUP <container>`. **Sessions
+belonging to a removed secret are disconnected**, while renaming a secret
+leaves its session alone. Adding or removing a domain needs a restart, as do
+the listen addresses, `cert_dir` and `behind_proxy`; such a change is refused,
+as is a file that does not parse, and the running configuration stays in place
+either way.
 
 `ee` (fake-TLS) secrets are rejected: Telegram Desktop marks them unsupported
 for this proxy type, since HTTPS already does what fake-TLS exists for.
@@ -217,6 +250,7 @@ is one static binary with no companion processes.
 | Frame batching | one frame per message | up to 4096 frames per message |
 | Cover site | static directory or built-in | static directory or loopback upstream |
 | Secrets | any number, hot reload and revocation | up to 32 profiles, restart to change |
+| Domains per process | any number | one (an explicit non-goal for v1) |
 
 Where the reference is ahead, it is ahead for good reasons: the HTTP long-poll
 carriers keep working where WebSocket does not, and batching costs it nothing.
