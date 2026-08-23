@@ -334,14 +334,15 @@ Both are worth having here and neither is implemented yet.
 
 ## Status
 
-Deployed and verified end to end: the probe completes `req_pq_multi` against
-every production data centre through a live relay. The protocol was read off
-the `dev` branch of tdesktop at release 7.1.1, then checked against the
-reference server's `PROTOCOL.md`; the frame format, the limits and the
-capability vectors agree.
+Working with Telegram Desktop. The protocol was read off the `dev` branch of
+tdesktop at release 7.1.1 and checked against the reference server's
+`PROTOCOL.md` — frame format, limits and capability vectors agree — and a real
+client has since connected through a deployed relay and carried traffic.
 
-Not yet driven by a running Telegram Desktop. The twin follows the client's
-source and the reference's specification, but it is still a twin.
+The automated checks stand behind that: the probe completes `req_pq_multi`
+against a production data centre over both carriers, and the test suite drives
+the whole stack against a twin that enforces the client's own strictness frame
+by frame.
 
 ## License
 
