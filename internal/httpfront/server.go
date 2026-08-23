@@ -90,6 +90,8 @@ func NewServer(h *Handler, cfg ServerConfig) *Server {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	go s.handler.Run(ctx)
+
 	errs := make(chan error, 2)
 	if s.plain != nil {
 		go func() {

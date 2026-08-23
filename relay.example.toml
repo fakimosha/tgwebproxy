@@ -13,11 +13,14 @@ cert_dir     = "certs"
 log_level    = "info"
 max_streams  = 64
 
-# Health and metrics. Loopback only, and the relay refuses to start if this is
-# anything else: an endpoint on the public port would be a fingerprint that
-# undoes the capability gate. Empty disables it.
+# Health and metrics. Either a loopback host:port or a path, which is taken as
+# a Unix socket; anything routable is refused, because an endpoint on the
+# public port would be a fingerprint that undoes the capability gate. In Docker
+# use the socket: a published port cannot reach a container's own loopback.
+# Empty disables it.
 [admin]
 listen = "127.0.0.1:9600"
+# listen = "/run/tgwebproxy/admin.sock"
 
 # Static cover site. Point it at something you would plausibly host.
 site = ""

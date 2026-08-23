@@ -32,6 +32,7 @@ func run() error {
 		dcID       = flag.Int("dc", 2, "data centre to reach through the relay")
 		insecure   = flag.Bool("insecure", false, "skip certificate verification, for a local test bed")
 		timeout    = flag.Duration("timeout", 20*time.Second, "per-step timeout")
+		carrier    = flag.String("carrier", "both", "which carrier to exercise: websocket, longpoll or both")
 	)
 	flag.Parse()
 
@@ -66,7 +67,24 @@ func run() error {
 	if err := checkGate(opts); err != nil {
 		return err
 	}
-	return checkTunnel(opts, sec, int16(*dcID), *timeout)
+
+	var carriers []string
+	switch *carrier {
+	case "both":
+		carriers = []string{"websocket", "longpoll"}
+	case "websocket", "longpoll":
+		carriers = []string{*carrier}
+	default:
+		return fmt.Errorf("-carrier must be websocket, longpoll or both")
+	}
+	for _, name := range carriers {
+		fmt.Printf("\n  carrier: %s\n", name)
+		if err := checkTunnel(name, opts, sec, int16(*dcID), *timeout); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	fmt.Println("\nOK: the relay carries real Telegram traffic end to end.")
+	return nil
 }
 
 // checkGate verifies the camouflage: a wrong capability must be answered
@@ -99,13 +117,26 @@ func checkGate(opts twin.DialOptions) error {
 	return nil
 }
 
-func checkTunnel(opts twin.DialOptions, sec secret.Secret, dcID int16, timeout time.Duration) error {
-	transport, err := twin.DialWS(opts)
-	if err != nil {
-		return fmt.Errorf("open the relay socket: %w", err)
+func checkTunnel(carrier string, opts twin.DialOptions, sec secret.Secret, dcID int16, timeout time.Duration) error {
+	var (
+		transport twin.Transport
+		err       error
+	)
+	if carrier == "longpoll" {
+		// The same page the client would load, then its fallback carrier.
+		transport, err = twin.DialPoll(opts)
+		if err != nil {
+			return fmt.Errorf("open the fallback carrier: %w", err)
+		}
+		step("fallback carrier open", "session token taken from the bridge page")
+	} else {
+		transport, err = twin.DialWS(opts)
+		if err != nil {
+			return fmt.Errorf("open the relay socket: %w", err)
+		}
+		step("websocket upgraded", "binary transport open")
 	}
 	defer transport.Close()
-	step("websocket upgraded", "binary transport open")
 
 	tw := twin.NewTwin(transport, sec)
 	if err := tw.Handshake(); err != nil {

@@ -282,6 +282,32 @@ From there on the server is an MTProxy: open an obfuscated2 connection to the
 DC with the same tag and DC id (no secret), and re-encrypt the stream in both
 directions.
 
+## 8a. Carrying the frames over plain HTTP
+
+Nothing in the client dictates how the bridge page reaches the server: the page
+is served by the relay, so the page-to-server carrier is the server author's
+choice. Telegram's reference server defines four (`https`, `https-lanes`,
+`websocket`, `websocket-lanes`) and picks one per profile; this relay serves a
+page that tries a WebSocket and falls back to plain HTTPS by itself.
+
+The fallback used here, for anyone implementing the same page:
+
+| Request | Headers | Meaning |
+|---|---|---|
+| `POST /` | `X-Tgwp-Session`, `X-Tgwp-Seq` | uplink batch, `204` on success |
+| `GET /` | `X-Tgwp-Session`, `X-Tgwp-Cursor` | downlink, held up to 25 s; `200` with a batch, `204` if nothing happened |
+| `DELETE /` | `X-Tgwp-Session` | end the session |
+
+A batch is length-prefixed messages: a 4-byte big-endian length, then that many
+bytes, repeated. The session token is minted by the relay and embedded in the
+bridge page; it is the credential for these requests, so the capability is not
+repeated in them.
+
+Numbering is the point. An HTTP request can be retried by anything in the path,
+and a batch applied twice would inject the same MTProto bytes twice. A repeat
+of the previous sequence number is answered from the previous result, and a gap
+is refused with `409` rather than guessed at.
+
 ## 9. What the server must look like from outside
 
 The client checks nothing about the HTTP response except that the page loads

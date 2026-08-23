@@ -17,7 +17,8 @@ document.
 
 ```
 Telegram Desktop ──hidden WebView──► bridge page (served by this relay)
-                                          │ WebSocket, same origin
+                                          │ WebSocket, or plain HTTPS
+                                          │ requests where it is blocked
                                           ▼
    capability gate ──► frame demultiplexer ──► obfuscated2 ──► Telegram DC
         └──► cover site for everyone else
@@ -167,6 +168,25 @@ its `wss://` URL from it. The vhost must forward the WebSocket upgrade
 (`Upgrade`/`Connection` headers) and should keep the query string out of the
 access log, because the capability is a bearer credential.
 
+## When a WebSocket does not survive
+
+The bridge page tries a WebSocket first and, if it does not come up, carries
+the same session over ordinary HTTPS requests: numbered `POST` batches for the
+uplink, and a `GET` the relay holds open until it has something to send. The
+relay above the carrier cannot tell the two apart, and the client twin enforces
+the same rules over both.
+
+The page decides, not the server. A network where a WebSocket is blocked or
+silently held open is discovered at runtime by the page that is already
+running, which is one advantage of the carrier being ours to choose: the
+reference server picks a mode per profile at start-up instead.
+
+Uplink batches carry a sequence number and downlink polls a cursor. This is not
+bookkeeping for its own sake — an HTTP request can be retried by anything in
+the path, and a batch applied twice would inject the same MTProto bytes twice
+and desynchronise the stream. A repeat of the previous number is answered from
+the previous result; a gap is refused outright.
+
 ## Health and metrics
 
 ```toml
@@ -193,9 +213,24 @@ client, which is what makes handing out access with a bot practical: issue a
 labelled secret, watch what it uses, remove the line and `SIGHUP` when the
 subscription ends.
 
-The listener must be on the loopback — the relay refuses to start otherwise,
-and a test asserts these paths do not exist on 443. An admin endpoint on the
-public port would be a fingerprint that undoes the gate.
+The listener must be private — a loopback `host:port`, or a filesystem path
+taken as a Unix socket. Anything routable is refused at start-up, and a test
+asserts these paths do not exist on 443: an admin endpoint on the public port
+would be a fingerprint that undoes the gate.
+
+**In Docker, use the socket.** A container that binds its own loopback cannot
+have that port published, so `-p 127.0.0.1:9600:9600` reaches nothing. Put the
+socket on a bind-mounted directory instead:
+
+```toml
+[admin]
+listen = "/run/tgwebproxy/admin.sock"
+```
+
+```bash
+docker run ... -v /run/tgwebproxy:/run/tgwebproxy tgwebproxy -config /conf/relay.toml
+curl --unix-socket /run/tgwebproxy/admin.sock http://admin/metrics
+```
 
 At start-up the relay also checks itself and says so in the log: whether this
 host can reach a data centre at all, whether `behind_proxy` is set while
@@ -287,7 +322,7 @@ is one static binary with no companion processes.
 | Needs Caddy/nginx | no, ACME built in | yes, Caddy owns 443 |
 | Deployment | any Go target, Docker | x86_64 Debian/Ubuntu installer |
 | Data-centre transport | IPv4 with IPv6 fallback | whatever MTProxy does |
-| Carriers | WebSocket | WebSocket, HTTP long poll, and per-stream lanes |
+| Carriers | WebSocket, HTTP long poll, chosen by the page | WebSocket, HTTP long poll, per-stream lanes, chosen by the server |
 | Frame batching | one frame per message | up to 4096 frames per message |
 | Cover site | static directory or built-in | static directory or loopback upstream |
 | Secrets | any number, hot reload and revocation | up to 32 profiles, restart to change |

@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"tgwebproxy/internal/metrics"
 )
@@ -86,5 +90,63 @@ func TestReadyzReportsAnUnreachableDataCentre(t *testing.T) {
 	}
 	if code, _ := get(t, base+"/healthz"); code != 200 {
 		t.Error("healthz must stay 200: the process itself is fine")
+	}
+}
+
+// Docker cannot publish a port that a process bound to the container's own
+// loopback, so a container that wants these counters needs a socket.
+func TestUnixSocketListener(t *testing.T) {
+	if _, err := net.Listen("unix", filepath.Join(t.TempDir(), "probe.sock")); err != nil {
+		t.Skipf("unix sockets are not available here: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "admin.sock")
+	registry := metrics.New()
+	registry.Add("tgwp_sessions_active", 2, "domain", "a.example.com", "label", "phone")
+
+	server, err := New(path, registry, nil)
+	if err != nil {
+		t.Fatalf("a socket path must be accepted: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		},
+	}}
+	var body string
+	for i := 0; i < 50; i++ {
+		resp, err := client.Get("http://admin/metrics")
+		if err != nil {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		body = string(raw)
+		break
+	}
+	if !strings.Contains(body, "tgwp_sessions_active") {
+		t.Errorf("metrics over the socket returned %q", body)
+	}
+
+	cancel()
+	<-done
+	if _, err := os.Stat(path); err == nil {
+		t.Error("the socket outlived the server")
+	}
+}
+
+// The "unix:" prefix is accepted for an address that would otherwise look
+// like a host:port.
+func TestUnixPrefix(t *testing.T) {
+	network, address, err := parseListen("unix:/run/tgwebproxy/admin.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if network != "unix" || address != "/run/tgwebproxy/admin.sock" {
+		t.Errorf("parseListen = %q %q", network, address)
 	}
 }

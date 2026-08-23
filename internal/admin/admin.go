@@ -10,6 +10,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"tgwebproxy/internal/metrics"
@@ -19,13 +22,21 @@ import (
 type ReadyFunc func(ctx context.Context) error
 
 type Server struct {
-	http *http.Server
+	http    *http.Server
+	network string
+	address string
 }
 
-// New builds the admin server. A listen address that is not on the loopback
-// is refused: exposing it is never what the operator meant.
+// New builds the admin server. The address is either a loopback host:port or
+// a filesystem path, which is taken as a Unix socket — anything routable is
+// refused, because exposing these counters is never what the operator meant.
+//
+// The socket form exists for containers: Docker cannot publish a port that a
+// process bound to the container's own loopback, so a bind-mounted socket is
+// the only way to keep the listener private and still reach it from the host.
 func New(listen string, registry *metrics.Registry, ready ReadyFunc) (*Server, error) {
-	if err := checkLoopback(listen); err != nil {
+	network, address, err := parseListen(listen)
+	if err != nil {
 		return nil, err
 	}
 	mux := http.NewServeMux()
@@ -50,11 +61,29 @@ func New(listen string, registry *metrics.Registry, ready ReadyFunc) (*Server, e
 		registry.WriteTo(w)
 	})
 
-	return &Server{http: &http.Server{
-		Addr:              listen,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}}, nil
+	return &Server{
+		network: network,
+		address: address,
+		http: &http.Server{
+			Addr:              address,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		},
+	}, nil
+}
+
+// parseListen decides between a Unix socket and a loopback TCP address.
+func parseListen(listen string) (network, address string, err error) {
+	if path, ok := strings.CutPrefix(listen, "unix:"); ok {
+		return "unix", path, nil
+	}
+	if strings.ContainsAny(listen, "/") || filepath.IsAbs(listen) {
+		return "unix", listen, nil
+	}
+	if err := checkLoopback(listen); err != nil {
+		return "", "", err
+	}
+	return "tcp", listen, nil
 }
 
 func checkLoopback(listen string) error {
@@ -75,9 +104,27 @@ func checkLoopback(listen string) error {
 
 // Run serves until the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if s.network == "unix" {
+		// A socket left behind by a killed process would block the bind.
+		_ = os.Remove(s.address)
+	}
+	listener, err := net.Listen(s.network, s.address)
+	if err != nil {
+		return err
+	}
+	if s.network == "unix" {
+		// Readable by the owner only: the endpoint has no authentication of
+		// its own, and the filesystem is what stands in for it.
+		if err := os.Chmod(s.address, 0o600); err != nil {
+			listener.Close()
+			return err
+		}
+		defer os.Remove(s.address)
+	}
+
 	errs := make(chan error, 1)
 	go func() {
-		if err := s.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.http.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- err
 		}
 	}()
@@ -97,10 +144,10 @@ func (s *Server) shutdown() {
 	_ = s.http.Shutdown(ctx)
 }
 
-func (s *Server) Addr() string { return s.http.Addr }
+func (s *Server) Addr() string { return s.address }
 
 // listen binds the configured address, so a caller (a test, mainly) can learn
 // the port before serving.
 func listen(s *Server) (net.Listener, error) {
-	return net.Listen("tcp", s.http.Addr)
+	return net.Listen(s.network, s.address)
 }

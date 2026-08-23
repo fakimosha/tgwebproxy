@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"tgwebproxy/internal/longpoll"
 	"tgwebproxy/internal/metrics"
 	"tgwebproxy/internal/relay"
 	"tgwebproxy/internal/secret"
@@ -40,6 +41,9 @@ type Config struct {
 	// Metrics receives counts, labelled by domain and by the secret's label.
 	// Nil means no accounting.
 	Metrics *metrics.Registry
+	// PollHold is how long a long-poll downlink request waits before it
+	// answers empty. Zero uses the package default.
+	PollHold time.Duration
 }
 
 // Domain is one served name.
@@ -58,6 +62,9 @@ type Handler struct {
 	diagnose    bool
 	upgrader    websocket.Upgrader
 	sessions    *sessionRegistry
+	polls       *longpoll.Manager
+	pollHold    time.Duration
+	pollCtx     context.Context
 	// live is swapped whole on reload, so a request either sees the old
 	// snapshot or the new one and never a mixture.
 	live atomic.Pointer[liveState]
@@ -102,6 +109,9 @@ func New(cfg Config) (*Handler, error) {
 		behindProxy: cfg.BehindProxy,
 		diagnose:    cfg.Diagnose,
 		sessions:    newSessionRegistry(),
+		polls:       longpoll.NewManager(),
+		pollHold:    cfg.PollHold,
+		pollCtx:     context.Background(),
 	}
 	h.live.Store(state)
 	h.upgrader = websocket.Upgrader{
@@ -143,6 +153,13 @@ func (h *Handler) Reload(next Live) error {
 }
 
 // Domains lists the served names, in configuration order.
+// Run drives the parts of the handler that outlive one request: the
+// long-poll session reaper. It returns when the context is cancelled.
+func (h *Handler) Run(ctx context.Context) {
+	h.pollCtx = ctx
+	h.polls.Run(ctx)
+}
+
 func (h *Handler) Domains() []string {
 	state := h.live.Load()
 	names := make([]string, 0, len(state.byHost))
@@ -262,6 +279,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"agent", shortAgent(r.UserAgent()))
 	}
 
+	if served && h.servePoll(w, r, state, domain, entry) {
+		return
+	}
+
 	if !authorized {
 		h.count("tgwp_gate_rejections_total", 1, "domain", domain.name)
 	}
@@ -277,7 +298,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if authorized {
-		h.serveBridge(w, r, domain)
+		h.serveBridge(w, r, state, domain, entry)
 		return
 	}
 	domain.cover.ServeHTTP(w, r)
@@ -315,8 +336,16 @@ func (h *Handler) match(domain *domainState, r *http.Request) (secret.Entry, boo
 	return domain.keyring.Match(r.URL.Query().Get("bridge"))
 }
 
-func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, domain *domainState) {
-	page, nonce, err := webassets.Bridge()
+func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, state *liveState, domain *domainState, entry secret.Entry) {
+	// The page carries a session token for the long-poll carrier, which it
+	// uses only if its WebSocket does not come up.
+	token, err := h.startPollSession(state, domain, entry, h.peerLabel(r))
+	if err != nil {
+		h.log.Error("cannot start a fallback session", "error", err)
+		domain.cover.ServeHTTP(w, r)
+		return
+	}
+	page, nonce, err := webassets.Bridge(token)
 	if err != nil {
 		h.log.Error("cannot render the bridge page", "error", err)
 		domain.cover.ServeHTTP(w, r)
@@ -331,7 +360,8 @@ func (h *Handler) serveBridge(w http.ResponseWriter, r *http.Request, domain *do
 		"default-src 'none'",
 		"script-src 'nonce-" + nonce + "'",
 		"style-src 'unsafe-inline'",
-		"connect-src wss://" + domain.name,
+		// wss for the socket, https for the long-poll fallback.
+		"connect-src wss://" + domain.name + " https://" + domain.name,
 		"base-uri 'none'",
 		"form-action 'none'",
 	}, "; "))

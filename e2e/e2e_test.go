@@ -417,3 +417,48 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// The relay above the carrier cannot tell a socket from a sequence of HTTP
+// requests, and the client twin enforces the same rules over both. This is the
+// long-poll path end to end: bridge page, numbered uplink, held downlink,
+// MTProto handshake and a round trip to a data centre.
+func TestLongPollCarriesTheWholeStack(t *testing.T) {
+	bed, connections := newBed(t, upper)
+
+	transport, err := twin.DialPoll(twin.DialOptions{
+		BaseURL:    bed.server.URL,
+		Domain:     domain,
+		Capability: bed.secret.Capability(domain),
+		TLSConfig:  &tls.Config{RootCAs: bed.pool, ServerName: domain},
+		Timeout:    20 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("dial the fallback carrier: %v", err)
+	}
+	defer transport.Close()
+
+	tw := twin.NewTwin(transport, bed.secret)
+	if err := tw.Handshake(); err != nil {
+		t.Fatalf("transport handshake over long poll: %v", err)
+	}
+	stop := runPump(t, tw)
+	defer stop()
+
+	stream, err := tw.Open(mtproto.PaddedIntermediate, 2)
+	if err != nil {
+		t.Fatalf("open a stream: %v", err)
+	}
+	if err := tw.Write(stream, []byte("carried over http")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := tw.Read(stream, 15*time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "CARRIED OVER HTTP" {
+		t.Fatalf("round trip returned %q", got)
+	}
+	if n := connections.Load(); n != 1 {
+		t.Errorf("the relay opened %d upstream connections, want 1", n)
+	}
+}
