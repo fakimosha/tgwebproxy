@@ -42,6 +42,10 @@ type DialFunc func(ctx context.Context, protocol uint32, dcID int16) (*Upstream,
 type Reporter interface {
 	StreamOpened()
 	StreamClosed()
+	// MessageWritten reports one transport message and how many more were
+	// already queued behind it. The second number is what batching would
+	// collapse, measured without changing what goes on the wire.
+	MessageWritten(alsoQueued int)
 	UpstreamDialFailed()
 	ProtocolError()
 	BytesUp(n int)
@@ -51,6 +55,7 @@ type Reporter interface {
 type nopReporter struct{}
 
 func (nopReporter) StreamOpened()       {}
+func (nopReporter) MessageWritten(int)  {}
 func (nopReporter) StreamClosed()       {}
 func (nopReporter) UpstreamDialFailed() {}
 func (nopReporter) ProtocolError()      {}
@@ -427,6 +432,7 @@ func (s *session) writeLoop() {
 		case <-s.ctx.Done():
 			return
 		case msg := <-s.out:
+			s.opts.Metrics.MessageWritten(len(s.out))
 			if err := s.conn.WriteMessage(msg); err != nil {
 				s.opts.Logger.Debug("write failed", "error", err)
 				s.cancel()

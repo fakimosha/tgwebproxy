@@ -63,6 +63,8 @@ func New() *Registry {
 		{"tgwp_upstream_dial_failures_total", "Failed connections to a data centre.", counter},
 		{"tgwp_protocol_errors_total", "Sessions dropped for breaking the transport contract.", counter},
 		{"tgwp_gate_rejections_total", "Requests answered with the cover site.", counter},
+		{"tgwp_transport_messages_total", "Transport messages written towards clients.", counter},
+		{"tgwp_coalescable_messages_total", "Messages already queued when another was written, which batching would have collapsed.", counter},
 	} {
 		r.meta[m.name] = metadata{help: m.help, kind: m.kind}
 	}

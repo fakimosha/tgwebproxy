@@ -486,7 +486,16 @@ func (r *reporter) StreamOpened() {
 	r.add("tgwp_streams_opened_total", 1)
 	r.add("tgwp_streams_active", 1)
 }
-func (r *reporter) StreamClosed()       { r.add("tgwp_streams_active", -1) }
+func (r *reporter) StreamClosed() { r.add("tgwp_streams_active", -1) }
+
+// MessageWritten counts what batching would save: every message that was
+// already waiting when another was written could have travelled with it.
+func (r *reporter) MessageWritten(alsoQueued int) {
+	r.add("tgwp_transport_messages_total", 1)
+	if alsoQueued > 0 {
+		r.add("tgwp_coalescable_messages_total", int64(alsoQueued))
+	}
+}
 func (r *reporter) UpstreamDialFailed() { r.add("tgwp_upstream_dial_failures_total", 1) }
 func (r *reporter) ProtocolError()      { r.add("tgwp_protocol_errors_total", 1) }
 func (r *reporter) BytesUp(n int)       { r.add("tgwp_bytes_up_total", int64(n)) }
